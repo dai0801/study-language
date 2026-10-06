@@ -6,9 +6,10 @@ on:
       mode:
         description: "Build mode"
         required: true
-        default: "full-audio"
+        default: "smoke-audio"
         type: choice
         options:
+          - smoke-audio
           - full-audio
           - fast-ui
 
@@ -23,21 +24,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - name: Keep existing static audio
         run: |
           if [ -d study_cloudbase_free/dist/audio ]; then
             mkdir -p /tmp/study-audio
             cp -a study_cloudbase_free/dist/audio/. /tmp/study-audio/
           fi
+
       - name: Build library and UI
         working-directory: study_cloudbase_free
         run: |
           npm install
           npm run build
           rm -rf dist/tts
+
       - name: Restore static audio
         run: |
           if [ -d /tmp/study-audio ]; then
@@ -47,6 +52,7 @@ jobs:
             echo "No existing audio found. Run full-audio once first."
             exit 1
           fi
+
       - name: Commit dist
         run: |
           git config user.name "github-actions[bot]"
@@ -60,19 +66,43 @@ jobs:
           fi
 
   build-data:
-    if: ${{ inputs.mode == 'full-audio' }}
+    if: ${{ inputs.mode == 'full-audio' || inputs.mode == 'smoke-audio' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      - name: Verify TTS build files exist
+        run: |
+          echo "Repository root:"
+          pwd
+          echo
+          echo "TTS source files:"
+          ls -la study_cloudbase_free/scripts/
+          ls -la study_cloudbase_free/requirements-tts.txt
+          test -f study_cloudbase_free/scripts/generate_static_tts.py
+          test -f study_cloudbase_free/requirements-tts.txt
+
       - name: Build large library
         working-directory: study_cloudbase_free
         run: |
           npm install
           npm run build
           rm -rf dist/tts
+
+      # Put the Python generator inside the artifact itself.
+      # The TTS jobs no longer depend on finding the script in a second checkout.
+      - name: Pack TTS build support into base artifact
+        run: |
+          mkdir -p study_cloudbase_free/dist/_tts_build
+          cp study_cloudbase_free/scripts/generate_static_tts.py study_cloudbase_free/dist/_tts_build/
+          cp study_cloudbase_free/requirements-tts.txt study_cloudbase_free/dist/_tts_build/
+          echo "Packed build support:"
+          ls -la study_cloudbase_free/dist/_tts_build/
+
       - uses: actions/upload-artifact@v4
         with:
           name: base-dist
@@ -80,7 +110,7 @@ jobs:
           retention-days: 1
 
   tts:
-    if: ${{ inputs.mode == 'full-audio' }}
+    if: ${{ inputs.mode == 'full-audio' || inputs.mode == 'smoke-audio' }}
     needs: build-data
     strategy:
       fail-fast: false
@@ -89,37 +119,92 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: base-dist
           path: study_cloudbase_free/dist
+
+      - name: Verify downloaded TTS support
+        run: |
+          echo "Downloaded dist:"
+          ls -la study_cloudbase_free/dist/
+          echo
+          echo "TTS build support:"
+          ls -la study_cloudbase_free/dist/_tts_build/
+          test -f study_cloudbase_free/dist/_tts_build/generate_static_tts.py
+          test -f study_cloudbase_free/dist/_tts_build/requirements-tts.txt
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-          cache-dependency-path: study_cloudbase_free/requirements-tts.txt
+          cache-dependency-path: study_cloudbase_free/dist/_tts_build/requirements-tts.txt
+
       - name: Install ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+
       - name: Install CPU TTS dependencies
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install -r study_cloudbase_free/requirements-tts.txt
+          pip install -r study_cloudbase_free/dist/_tts_build/requirements-tts.txt
+
       - name: Generate ${{ matrix.lang }} static audio
+        shell: bash
         run: |
-          python study_cloudbase_free/scripts/generate_static_tts.py \
+          EXTRA=""
+          if [ "${{ inputs.mode }}" = "smoke-audio" ]; then
+            EXTRA="--limit 12"
+          fi
+
+          python study_cloudbase_free/dist/_tts_build/generate_static_tts.py \
             --lang ${{ matrix.lang }} \
             --dist study_cloudbase_free/dist \
             --shard-size 60 \
-            --bitrate 32k
+            --bitrate 32k \
+            $EXTRA
+
       - uses: actions/upload-artifact@v4
         with:
           name: tts-${{ matrix.lang }}
           path: study_cloudbase_free/dist/audio/${{ matrix.lang }}
           retention-days: 1
+
+  smoke-result:
+    if: ${{ inputs.mode == 'smoke-audio' }}
+    needs: [build-data, tts]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tts-ko
+          path: smoke/audio/ko
+      - uses: actions/download-artifact@v4
+        with:
+          name: tts-en
+          path: smoke/audio/en
+      - uses: actions/download-artifact@v4
+        with:
+          name: tts-th
+          path: smoke/audio/th
+
+      - name: Verify three-language smoke audio
+        run: |
+          echo "Korean:"
+          find smoke/audio/ko -maxdepth 1 -type f -printf "%f\n"
+          echo "English:"
+          find smoke/audio/en -maxdepth 1 -type f -printf "%f\n"
+          echo "Thai:"
+          find smoke/audio/th -maxdepth 1 -type f -printf "%f\n"
+
+          test -f smoke/audio/ko/manifest.json
+          test -f smoke/audio/en/manifest.json
+          test -f smoke/audio/th/manifest.json
+
+          echo
+          echo "SMOKE TEST PASSED: Korean, English and Thai static TTS all generated successfully."
 
   merge:
     if: ${{ inputs.mode == 'full-audio' }}
@@ -129,22 +214,31 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           name: base-dist
           path: study_cloudbase_free/dist
+
       - uses: actions/download-artifact@v4
         with:
           name: tts-ko
           path: study_cloudbase_free/dist/audio/ko
+
       - uses: actions/download-artifact@v4
         with:
           name: tts-en
           path: study_cloudbase_free/dist/audio/en
+
       - uses: actions/download-artifact@v4
         with:
           name: tts-th
           path: study_cloudbase_free/dist/audio/th
+
+      - name: Remove build-only files
+        run: |
+          rm -rf study_cloudbase_free/dist/_tts_build
+
       - name: Commit complete dist
         run: |
           git config user.name "github-actions[bot]"
