@@ -22,16 +22,14 @@
   - https://tatoeba.org/en/downloads
   - 使用韩→中、英→中、泰→中句对；具体句子依其各自许可使用。
 
-## 本地神经语音（V3.6）
-本版不再使用 eSpeak 作为手机备用语音，也不需要 Azure / Gemini / Cartesia API Key。
-浏览器使用 Transformers.js + Meta MMS TTS 的 ONNX 转换模型，在用户设备本地生成语音。
+## 静态预生成神经语音（V3.7）
+为保证手机和电脑点击“聆听”后快速播放，本版不在手机端实时运行神经语音模型，
+而是在 GitHub Actions 构建阶段用 MMS TTS 预生成 AAC 音频分片，再作为普通静态音频由 CloudBase 托管。
 
-- 英语：Xenova/mms-tts-eng
-  - https://huggingface.co/Xenova/mms-tts-eng
-- 韩语：Xenova/mms-tts-kor
-  - https://huggingface.co/Xenova/mms-tts-kor
-- 泰语：payam1394/traxlate-mms-tts-tha
-  - https://huggingface.co/payam1394/traxlate-mms-tts-tha
+- 英语模型：facebook/mms-tts-eng
+- 韩语模型：facebook/mms-tts-kor
+- 泰语模型：facebook/mms-tts-tha
+- 模型许可：CC BY-NC 4.0（非商业）
+- 浏览器端不需要 API Key，不存在按分钟的 TTS API 免费额度。
 
-MMS 模型许可：CC BY-NC 4.0（非商业）。
-因此当前本地 TTS 方案适用于本项目的个人、非商业学习用途；如果未来做商业化版本，应更换为允许商业使用的语音方案。
+MMS 模型适用于本项目当前的个人、非商业学习用途。如果未来商业化，应更换允许商业使用的语音模型或服务。
