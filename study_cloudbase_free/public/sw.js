@@ -1,5 +1,5 @@
-const CACHE = 'study-v3.4.2-human-speed';
-const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.json', './icon.svg'];
+const CACHE = 'study-v3.6-single-card-fast-local-tts';
+const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.json', './icon.svg', './SOURCES.md'];
 
 self.addEventListener('install', event => {
   self.skipWaiting();
@@ -8,13 +8,23 @@ self.addEventListener('install', event => {
 
 self.addEventListener('activate', event => {
   event.waitUntil(Promise.all([
-    caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))),
+    caches.keys().then(keys => Promise.all(
+      keys
+        .filter(k => k.startsWith('study-v') && k !== CACHE)
+        .map(k => caches.delete(k))
+    )),
     self.clients.claim()
   ]));
 });
 
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
+  const url = new URL(event.request.url);
+
+  // Hugging Face / jsDelivr 等跨域模型文件交给浏览器与 Transformers.js 自己缓存，
+  // 避免被 Study 的 service worker 重复存储或在升级时误删。
+  if (url.origin !== self.location.origin) return;
+
   event.respondWith(
     fetch(event.request)
       .then(response => {
@@ -24,6 +34,8 @@ self.addEventListener('fetch', event => {
         }
         return response;
       })
-      .catch(() => caches.match(event.request).then(cached => cached || (event.request.mode==='navigate' ? caches.match('./index.html') : undefined)))
+      .catch(() => caches.match(event.request).then(
+        cached => cached || (event.request.mode === 'navigate' ? caches.match('./index.html') : undefined)
+      ))
   );
 });
