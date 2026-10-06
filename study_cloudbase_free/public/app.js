@@ -11309,14 +11309,24 @@ function langInfo() { return LANGS[state.lang]; }
 function aiProviderInfo() { return AI_PROVIDERS[state.ai.provider] || AI_PROVIDERS.openrouter; }
 
 const SPEECH_LANGS = { ko:'ko-KR', en:'en-US', th:'th-TH' };
+const FALLBACK_SPEECH_VOICES = { ko:'ko', en:'en', th:'th' };
 let speechVoices = [];
 let speechVoiceCache = {};
 let speechWarmTimer = null;
+let fallbackTtsPromise = null;
+let fallbackTts = null;
+let fallbackAudioContext = null;
+let fallbackAudioSource = null;
 
 function speechAPI() {
   const synth = window.speechSynthesis || globalThis.speechSynthesis || null;
   const Utterance = window.SpeechSynthesisUtterance || globalThis.SpeechSynthesisUtterance || null;
   return { synth, Utterance };
+}
+
+function hasNativeSpeech() {
+  const { synth, Utterance } = speechAPI();
+  return !!(synth && typeof synth.speak === 'function' && typeof Utterance === 'function');
 }
 
 function refreshSpeechVoices() {
@@ -11339,7 +11349,6 @@ function warmSpeechVoices() {
   if (!synth) return;
   refreshSpeechVoices();
   const update = () => refreshSpeechVoices();
-  // 不同手机内核触发方式不同：事件 + 短轮询一起做，避免把“语音列表尚未加载”误判成不支持。
   if (typeof synth.addEventListener === 'function') synth.addEventListener('voiceschanged', update);
   else if ('onvoiceschanged' in synth) synth.onvoiceschanged = update;
   let attempts = 0;
@@ -11369,14 +11378,135 @@ function bestVoiceFor(langCode) {
   return chosen;
 }
 
+function primeFallbackAudio() {
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextCtor) return null;
+  try {
+    if (!fallbackAudioContext) fallbackAudioContext = new AudioContextCtor();
+    if (fallbackAudioContext.state === 'suspended') fallbackAudioContext.resume().catch(()=>{});
+    return fallbackAudioContext;
+  } catch (err) {
+    console.warn('fallback audio context unavailable', err);
+    return null;
+  }
+}
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[data-study-src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === '1') return resolve();
+      existing.addEventListener('load', resolve, { once:true });
+      existing.addEventListener('error', reject, { once:true });
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.dataset.studySrc = src;
+    script.onload = () => { script.dataset.loaded = '1'; resolve(); };
+    script.onerror = () => reject(new Error('备用语音脚本加载失败'));
+    document.head.appendChild(script);
+  });
+}
+
+function ensureFallbackTTS() {
+  if (fallbackTts) return Promise.resolve(fallbackTts);
+  if (fallbackTtsPromise) return fallbackTtsPromise;
+
+  fallbackTtsPromise = (async () => {
+    if (typeof Worker !== 'function') throw new Error('当前浏览器不支持 Web Worker');
+    if (!primeFallbackAudio()) throw new Error('当前浏览器不支持 Web Audio');
+
+    const scriptUrl = new URL('./tts/espeakng-simple.js', location.href).href;
+    const workerUrl = new URL('./tts/espeakng.worker.js', location.href).href;
+    await loadScriptOnce(scriptUrl);
+    if (typeof globalThis.SimpleTTS !== 'function') throw new Error('备用语音引擎初始化失败');
+
+    const tts = new globalThis.SimpleTTS({
+      workerPath: workerUrl,
+      defaultVoice: 'en',
+      defaultRate: 165,
+      defaultPitch: 50,
+      defaultVolume: 1,
+      enhanceAudio: false
+    });
+
+    return await new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error('备用语音加载超时')); }
+      }, 25000);
+      try {
+        tts.onReady(() => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          fallbackTts = tts;
+          resolve(tts);
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  })().catch(err => {
+    fallbackTtsPromise = null;
+    throw err;
+  });
+
+  return fallbackTtsPromise;
+}
+
+function playFallbackSamples(audioData, sampleRate) {
+  const ctx = primeFallbackAudio();
+  if (!ctx) throw new Error('当前浏览器不能播放备用语音');
+  if (!audioData || !audioData.length) throw new Error('没有生成语音数据');
+
+  try { fallbackAudioSource?.stop?.(); } catch {}
+  const samples = audioData instanceof Float32Array ? audioData : Float32Array.from(audioData);
+  const buffer = ctx.createBuffer(1, samples.length, Number(sampleRate) || 11025);
+  buffer.copyToChannel(samples, 0);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.onended = () => { if (fallbackAudioSource === source) fallbackAudioSource = null; };
+  fallbackAudioSource = source;
+  if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
+  source.start(0);
+}
+
+async function speakWithFallback(value, { announce=true } = {}) {
+  if (announce) showToast('正在切换到网站备用语音…');
+  try {
+    const tts = await ensureFallbackTTS();
+    const voice = FALLBACK_SPEECH_VOICES[state.lang] || 'en';
+    const rate = state.lang === 'en' ? 165 : 150;
+    tts.speak(value, { voice, rate, pitch:50, volume:1, enhance:false }, (audioData, sampleRate) => {
+      try { playFallbackSamples(audioData, sampleRate); }
+      catch (err) { console.warn('fallback playback failed', err); showToast('备用语音生成成功，但当前浏览器阻止了播放'); }
+    });
+  } catch (err) {
+    console.warn('fallback tts failed', err);
+    showToast(`备用语音暂不可用：${err.message || '请稍后重试'}`);
+  }
+}
+
+function warmFallbackTTS() {
+  if (hasNativeSpeech()) return;
+  setTimeout(() => ensureFallbackTTS().catch(err => console.warn('fallback tts warmup failed', err)), 600);
+}
+
 function speakText(text) {
   const value = String(text || '').trim();
   if (!value) { showToast('没有可聆听的内容'); return; }
 
+  // 在真实用户点击期间先解锁 Web Audio；若系统接口不可用，备用语音也能在异步生成后播放。
+  primeFallbackAudio();
+
   const { synth, Utterance } = speechAPI();
-  // 手机端不再用 “'speechSynthesis' in window + 全局构造器” 的严格判断；部分内核只挂在 window 上。
   if (!synth || typeof synth.speak !== 'function' || typeof Utterance !== 'function') {
-    showToast('当前手机内核没有开放系统朗读接口');
+    speakWithFallback(value);
     return;
   }
 
@@ -11384,7 +11514,7 @@ function speakText(text) {
   let utter;
   try { utter = new Utterance(value); }
   catch {
-    showToast('系统朗读初始化失败，请重新打开页面再试');
+    speakWithFallback(value);
     return;
   }
 
@@ -11393,36 +11523,41 @@ function speakText(text) {
   utter.pitch = 1;
   utter.volume = 1;
 
-  // getVoices() 在很多手机上首次会返回空数组。空数组不代表不能读：让系统按 lang 自动选默认语音即可。
   const voice = bestVoiceFor(speechLang);
   if (voice) utter.voice = voice;
 
   let started = false;
+  let fallbackStarted = false;
+  const fallbackOnce = () => {
+    if (fallbackStarted) return;
+    fallbackStarted = true;
+    speakWithFallback(value);
+  };
+
   utter.onstart = () => { started = true; };
   utter.onerror = event => {
     const reason = String(event?.error || '').toLowerCase();
     if (reason === 'canceled' || reason === 'interrupted') return;
-    if (!started && (reason === 'not-allowed' || reason === 'audio-busy')) {
-      showToast('请再点一次“聆听”以允许手机播放语音');
-      return;
-    }
-    showToast(`当前设备的${langInfo().name}语音暂不可用`);
+    console.warn('native speech failed', reason || event);
+    fallbackOnce();
   };
 
   try {
-    // 某些 Android / iOS 内核暂停过 synthesis，需要先 resume；保持在用户点击事件内直接 speak，减少移动端延迟。
     synth.resume?.();
     if (synth.speaking || synth.pending) synth.cancel();
     synth.speak(utter);
 
-    // 部分手机第一次点击后才异步加载 voice；后台刷新，不阻塞本次朗读。
     if (!voice) {
       setTimeout(() => refreshSpeechVoices(), 120);
       setTimeout(() => refreshSpeechVoices(), 500);
     }
+    // 个别内核存在 speechSynthesis 对象但永远不触发 start/error；短暂等待后自动兜底。
+    setTimeout(() => {
+      if (!started && !fallbackStarted && !synth.speaking && !synth.pending) fallbackOnce();
+    }, 1200);
   } catch (err) {
     console.warn('speech synthesis failed', err);
-    showToast('系统朗读启动失败，请刷新页面后再试');
+    fallbackOnce();
   }
 }
 
@@ -11967,6 +12102,7 @@ if ('serviceWorker' in navigator && (location.protocol==='https:' || location.ho
 }
 
 warmSpeechVoices();
+warmFallbackTTS();
 ensureMaterialBank(state.lang);
 render();
 handleOpenRouterCallback();

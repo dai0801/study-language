@@ -30,3 +30,10 @@
 
 ## Study 自编核心库
 网站还保留一小套自编核心词句，确保开放数据源临时不可访问时网站仍可正常使用。
+
+
+## 手机浏览器备用聆听
+- eSpeak-ng JavaScript fallback TTS
+  - https://github.com/steveseguin/espeakng.js
+  - GPLv3。用于任何未向网页开放系统 `speechSynthesis` 接口、或系统朗读启动失败的手机/电脑浏览器作为备用朗读。
+  - 备用语音完全在浏览器本地生成，不调用付费 TTS API；声音会比系统语音更机械。
