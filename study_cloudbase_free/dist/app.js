@@ -11308,257 +11308,407 @@ function saveState() { localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 function langInfo() { return LANGS[state.lang]; }
 function aiProviderInfo() { return AI_PROVIDERS[state.ai.provider] || AI_PROVIDERS.openrouter; }
 
-const SPEECH_LANGS = { ko:'ko-KR', en:'en-US', th:'th-TH' };
-const FALLBACK_SPEECH_VOICES = { ko:'ko', en:'en', th:'th' };
-let speechVoices = [];
-let speechVoiceCache = {};
-let speechWarmTimer = null;
-let fallbackTtsPromise = null;
-let fallbackTts = null;
-let fallbackAudioContext = null;
-let fallbackAudioSource = null;
 
-function speechAPI() {
-  const synth = window.speechSynthesis || globalThis.speechSynthesis || null;
-  const Utterance = window.SpeechSynthesisUtterance || globalThis.SpeechSynthesisUtterance || null;
-  return { synth, Utterance };
+const LOCAL_TTS_MODELS = {
+  ko: { id:'Xenova/mms-tts-kor', label:'韩语' },
+  en: { id:'Xenova/mms-tts-eng', label:'英语' },
+  th: { id:'payam1394/traxlate-mms-tts-tha', label:'泰语' }
+};
+const LOCAL_TTS_LIBRARY_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+const LOCAL_TTS_DB_NAME = 'study-local-tts-v2';
+const LOCAL_TTS_DB_STORE = 'audio';
+const LOCAL_TTS_CACHE_PREFIX = 'mms-q8-v2';
+const LOCAL_TTS_MAX_SAVED = 1200;
+
+let localTtsLibPromise = null;
+let localTtsEngine = { lang:null, pipe:null, loading:null };
+let localTtsAudioContext = null;
+let localTtsAudioSource = null;
+let localTtsDbPromise = null;
+let localTtsWarmTimer = null;
+let localTtsTrimCounter = 0;
+const localTtsInflight = new Map();
+const localTtsDecoded = new Map();
+
+function localTtsKey(lang, text) {
+  return `${LOCAL_TTS_CACHE_PREFIX}|${lang}|${String(text || '').trim()}`;
 }
 
-function hasNativeSpeech() {
-  const { synth, Utterance } = speechAPI();
-  return !!(synth && typeof synth.speak === 'function' && typeof Utterance === 'function');
-}
-
-function refreshSpeechVoices() {
-  const { synth } = speechAPI();
-  if (!synth || typeof synth.getVoices !== 'function') return [];
-  try {
-    const voices = synth.getVoices() || [];
-    if (voices.length) {
-      speechVoices = voices;
-      speechVoiceCache = {};
-    }
-    return voices;
-  } catch {
-    return [];
-  }
-}
-
-function warmSpeechVoices() {
-  const { synth } = speechAPI();
-  if (!synth) return;
-  refreshSpeechVoices();
-  const update = () => refreshSpeechVoices();
-  if (typeof synth.addEventListener === 'function') synth.addEventListener('voiceschanged', update);
-  else if ('onvoiceschanged' in synth) synth.onvoiceschanged = update;
-  let attempts = 0;
-  clearInterval(speechWarmTimer);
-  speechWarmTimer = setInterval(() => {
-    attempts += 1;
-    const voices = refreshSpeechVoices();
-    if (voices.length || attempts >= 12) {
-      clearInterval(speechWarmTimer);
-      speechWarmTimer = null;
-    }
-  }, 250);
-}
-
-function bestVoiceFor(langCode) {
-  if (speechVoiceCache[langCode]) return speechVoiceCache[langCode];
-  const prefix = langCode.slice(0,2).toLowerCase();
-  const live = refreshSpeechVoices();
-  const list = live.length ? live : speechVoices;
-  const candidates = list.filter(v => String(v.lang || '').toLowerCase().startsWith(prefix));
-  const chosen = candidates.find(v => v.localService && String(v.lang).toLowerCase() === langCode.toLowerCase())
-    || candidates.find(v => String(v.lang).toLowerCase() === langCode.toLowerCase())
-    || candidates.find(v => v.localService)
-    || candidates[0]
-    || null;
-  if (chosen) speechVoiceCache[langCode] = chosen;
-  return chosen;
-}
-
-function primeFallbackAudio() {
+function primeLocalTtsAudio() {
   const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
   if (!AudioContextCtor) return null;
   try {
-    if (!fallbackAudioContext) fallbackAudioContext = new AudioContextCtor();
-    if (fallbackAudioContext.state === 'suspended') fallbackAudioContext.resume().catch(()=>{});
-    return fallbackAudioContext;
+    if (!localTtsAudioContext) localTtsAudioContext = new AudioContextCtor();
+    if (localTtsAudioContext.state === 'suspended') localTtsAudioContext.resume().catch(()=>{});
+    return localTtsAudioContext;
   } catch (err) {
-    console.warn('fallback audio context unavailable', err);
+    console.warn('local tts audio context unavailable', err);
     return null;
   }
 }
 
-function loadScriptOnce(src) {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[data-study-src="${src}"]`);
-    if (existing) {
-      if (existing.dataset.loaded === '1') return resolve();
-      existing.addEventListener('load', resolve, { once:true });
-      existing.addEventListener('error', reject, { once:true });
-      return;
-    }
-    const script = document.createElement('script');
-    script.src = src;
-    script.async = true;
-    script.dataset.studySrc = src;
-    script.onload = () => { script.dataset.loaded = '1'; resolve(); };
-    script.onerror = () => reject(new Error('备用语音脚本加载失败'));
-    document.head.appendChild(script);
-  });
+function stopLocalTtsAudio() {
+  try { localTtsAudioSource?.stop?.(); } catch {}
+  localTtsAudioSource = null;
 }
 
-function ensureFallbackTTS() {
-  if (fallbackTts) return Promise.resolve(fallbackTts);
-  if (fallbackTtsPromise) return fallbackTtsPromise;
-
-  fallbackTtsPromise = (async () => {
-    if (typeof Worker !== 'function') throw new Error('当前浏览器不支持 Web Worker');
-    if (!primeFallbackAudio()) throw new Error('当前浏览器不支持 Web Audio');
-
-    const scriptUrl = new URL('./tts/espeakng-simple.js', location.href).href;
-    const workerUrl = new URL('./tts/espeakng.worker.js', location.href).href;
-    await loadScriptOnce(scriptUrl);
-    if (typeof globalThis.SimpleTTS !== 'function') throw new Error('备用语音引擎初始化失败');
-
-    const tts = new globalThis.SimpleTTS({
-      workerPath: workerUrl,
-      defaultVoice: 'en',
-      defaultRate: 210,
-      defaultPitch: 50,
-      defaultVolume: 1,
-      enhanceAudio: false
-    });
-
-    return await new Promise((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (!settled) { settled = true; reject(new Error('备用语音加载超时')); }
-      }, 25000);
-      try {
-        tts.onReady(() => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          fallbackTts = tts;
-          resolve(tts);
-        });
-      } catch (err) {
-        clearTimeout(timer);
-        reject(err);
-      }
-    });
-  })().catch(err => {
-    fallbackTtsPromise = null;
-    throw err;
-  });
-
-  return fallbackTtsPromise;
+function rememberDecodedAudio(key, buffer) {
+  if (!buffer) return;
+  if (localTtsDecoded.has(key)) localTtsDecoded.delete(key);
+  localTtsDecoded.set(key, buffer);
+  while (localTtsDecoded.size > 24) {
+    const oldest = localTtsDecoded.keys().next().value;
+    localTtsDecoded.delete(oldest);
+  }
 }
 
-function playFallbackSamples(audioData, sampleRate) {
-  const ctx = primeFallbackAudio();
-  if (!ctx) throw new Error('当前浏览器不能播放备用语音');
-  if (!audioData || !audioData.length) throw new Error('没有生成语音数据');
-
-  try { fallbackAudioSource?.stop?.(); } catch {}
-  const samples = audioData instanceof Float32Array ? audioData : Float32Array.from(audioData);
-  const buffer = ctx.createBuffer(1, samples.length, Number(sampleRate) || 11025);
-  buffer.copyToChannel(samples, 0);
+function playAudioBuffer(buffer) {
+  const ctx = primeLocalTtsAudio();
+  if (!ctx || !buffer) throw new Error('当前浏览器不能播放本地语音');
+  stopLocalTtsAudio();
   const source = ctx.createBufferSource();
   source.buffer = buffer;
   source.connect(ctx.destination);
-  source.onended = () => { if (fallbackAudioSource === source) fallbackAudioSource = null; };
-  fallbackAudioSource = source;
+  source.onended = () => { if (localTtsAudioSource === source) localTtsAudioSource = null; };
+  localTtsAudioSource = source;
   if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
   source.start(0);
 }
 
-async function speakWithFallback(value, { announce=true } = {}) {
-  if (announce) showToast('正在切换到网站备用语音…');
+function playFloatSamples(samples, sampleRate, key='') {
+  const ctx = primeLocalTtsAudio();
+  if (!ctx) throw new Error('当前浏览器不能播放本地语音');
+  const data = samples instanceof Float32Array ? samples : Float32Array.from(samples || []);
+  if (!data.length) throw new Error('没有生成有效语音');
+  const buffer = ctx.createBuffer(1, data.length, Number(sampleRate) || 16000);
+  buffer.copyToChannel(data, 0);
+  if (key) rememberDecodedAudio(key, buffer);
+  playAudioBuffer(buffer);
+}
+
+function floatSamplesToWavBlob(samples, sampleRate) {
+  const data = samples instanceof Float32Array ? samples : Float32Array.from(samples || []);
+  const rate = Number(sampleRate) || 16000;
+  const buffer = new ArrayBuffer(44 + data.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset, value) => {
+    for (let i=0; i<value.length; i++) view.setUint8(offset+i, value.charCodeAt(i));
+  };
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + data.length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, data.length * 2, true);
+  let offset = 44;
+  for (let i=0; i<data.length; i++, offset+=2) {
+    const value = Math.max(-1, Math.min(1, data[i]));
+    view.setInt16(offset, value < 0 ? value * 0x8000 : value * 0x7fff, true);
+  }
+  return new Blob([buffer], { type:'audio/wav' });
+}
+
+function openLocalTtsDb() {
+  if (localTtsDbPromise) return localTtsDbPromise;
+  localTtsDbPromise = new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) return reject(new Error('IndexedDB unavailable'));
+    const request = indexedDB.open(LOCAL_TTS_DB_NAME, 2);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      let store;
+      if (!db.objectStoreNames.contains(LOCAL_TTS_DB_STORE)) {
+        store = db.createObjectStore(LOCAL_TTS_DB_STORE, { keyPath:'key' });
+      } else {
+        store = request.transaction.objectStore(LOCAL_TTS_DB_STORE);
+      }
+      if (!store.indexNames.contains('createdAt')) store.createIndex('createdAt', 'createdAt');
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
+  }).catch(err => {
+    localTtsDbPromise = null;
+    console.warn('local tts cache unavailable', err);
+    return null;
+  });
+  return localTtsDbPromise;
+}
+
+async function getSavedLocalTts(key) {
+  const db = await openLocalTtsDb();
+  if (!db) return null;
+  return new Promise(resolve => {
+    try {
+      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readonly');
+      const req = tx.objectStore(LOCAL_TTS_DB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+}
+
+async function trimSavedLocalTts() {
+  const db = await openLocalTtsDb();
+  if (!db) return;
   try {
-    const tts = await ensureFallbackTTS();
-    const voice = FALLBACK_SPEECH_VOICES[state.lang] || 'en';
-    const rate = 210;
-    tts.speak(value, { voice, rate, pitch:50, volume:1, enhance:false }, (audioData, sampleRate) => {
-      try { playFallbackSamples(audioData, sampleRate); }
-      catch (err) { console.warn('fallback playback failed', err); showToast('备用语音生成成功，但当前浏览器阻止了播放'); }
+    const count = await new Promise(resolve => {
+      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readonly');
+      const req = tx.objectStore(LOCAL_TTS_DB_STORE).count();
+      req.onsuccess = () => resolve(Number(req.result || 0));
+      req.onerror = () => resolve(0);
+    });
+    let removeCount = Math.max(0, count - LOCAL_TTS_MAX_SAVED);
+    if (!removeCount) return;
+    await new Promise(resolve => {
+      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readwrite');
+      const index = tx.objectStore(LOCAL_TTS_DB_STORE).index('createdAt');
+      const req = index.openKeyCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor || removeCount <= 0) return;
+        tx.objectStore(LOCAL_TTS_DB_STORE).delete(cursor.primaryKey);
+        removeCount -= 1;
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
     });
   } catch (err) {
-    console.warn('fallback tts failed', err);
-    showToast(`备用语音暂不可用：${err.message || '请稍后重试'}`);
+    console.warn('local tts cache trim failed', err);
   }
 }
 
-function warmFallbackTTS() {
-  if (hasNativeSpeech()) return;
-  setTimeout(() => ensureFallbackTTS().catch(err => console.warn('fallback tts warmup failed', err)), 600);
+async function saveLocalTts(key, lang, text, blob) {
+  const db = await openLocalTtsDb();
+  if (!db || !blob) return;
+  try {
+    await new Promise(resolve => {
+      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readwrite');
+      tx.objectStore(LOCAL_TTS_DB_STORE).put({
+        key, lang, text, blob, createdAt:Date.now()
+      });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+    localTtsTrimCounter += 1;
+    if (localTtsTrimCounter % 20 === 0) trimSavedLocalTts();
+  } catch (err) {
+    console.warn('local tts cache save failed', err);
+  }
 }
 
-function speakText(text) {
-  const value = String(text || '').trim();
-  if (!value) { showToast('没有可聆听的内容'); return; }
+async function loadLocalTtsLibrary() {
+  if (localTtsLibPromise) return localTtsLibPromise;
+  localTtsLibPromise = import(LOCAL_TTS_LIBRARY_URL).then(mod => {
+    if (mod?.env) {
+      mod.env.allowLocalModels = false;
+      mod.env.useBrowserCache = true;
+      try {
+        if (mod.env.backends?.onnx?.wasm) mod.env.backends.onnx.wasm.numThreads = 1;
+      } catch {}
+    }
+    return mod;
+  }).catch(err => {
+    localTtsLibPromise = null;
+    throw err;
+  });
+  return localTtsLibPromise;
+}
 
-  // 在真实用户点击期间先解锁 Web Audio；若系统接口不可用，备用语音也能在异步生成后播放。
-  primeFallbackAudio();
+async function disposeLocalTtsEngine() {
+  const old = localTtsEngine.pipe;
+  localTtsEngine = { lang:null, pipe:null, loading:null };
+  try { await old?.dispose?.(); } catch {}
+}
 
-  const { synth, Utterance } = speechAPI();
+async function ensureLocalTtsEngine(lang) {
+  const targetLang = LOCAL_TTS_MODELS[lang] ? lang : 'en';
+  if (localTtsEngine.lang === targetLang && localTtsEngine.pipe) return localTtsEngine.pipe;
+  if (localTtsEngine.lang === targetLang && localTtsEngine.loading) return localTtsEngine.loading;
+
+  const loading = (async () => {
+    const mod = await loadLocalTtsLibrary();
+    const cfg = LOCAL_TTS_MODELS[targetLang];
+    if (localTtsEngine.pipe && localTtsEngine.lang !== targetLang) await disposeLocalTtsEngine();
+
+    let pipe;
+    try {
+      pipe = await mod.pipeline('text-to-speech', cfg.id, { dtype:'q8', device:'wasm' });
+    } catch (firstErr) {
+      console.warn('q8 tts load failed, retry default mode', firstErr);
+      pipe = await mod.pipeline('text-to-speech', cfg.id, { device:'wasm' });
+    }
+    localTtsEngine = { lang:targetLang, pipe, loading:null };
+    return pipe;
+  })();
+
+  localTtsEngine = { lang:targetLang, pipe:null, loading };
+  try {
+    return await loading;
+  } catch (err) {
+    if (localTtsEngine.loading === loading) localTtsEngine = { lang:null, pipe:null, loading:null };
+    throw err;
+  }
+}
+
+function nativeSpeechFallback(value, lang) {
+  const synth = window.speechSynthesis;
+  const Utterance = window.SpeechSynthesisUtterance;
   if (!synth || typeof synth.speak !== 'function' || typeof Utterance !== 'function') {
-    speakWithFallback(value);
-    return;
+    showToast('当前浏览器暂时无法播放语音');
+    return false;
   }
-
-  const speechLang = SPEECH_LANGS[state.lang] || 'en-US';
-  let utter;
-  try { utter = new Utterance(value); }
-  catch {
-    speakWithFallback(value);
-    return;
+  const codes = { ko:'ko-KR', en:'en-US', th:'th-TH' };
+  try {
+    synth.cancel();
+    const utter = new Utterance(value);
+    utter.lang = codes[lang] || 'en-US';
+    utter.rate = 1;
+    utter.pitch = 1;
+    utter.volume = 1;
+    synth.speak(utter);
+    return true;
+  } catch {
+    showToast('当前浏览器暂时无法播放语音');
+    return false;
   }
+}
 
-  utter.lang = speechLang;
-  utter.rate = 1.0;
-  utter.pitch = 1;
-  utter.volume = 1;
+async function decodeAndPlaySavedLocalTts(key, blob) {
+  const cachedDecoded = localTtsDecoded.get(key);
+  if (cachedDecoded) {
+    playAudioBuffer(cachedDecoded);
+    return true;
+  }
+  const ctx = primeLocalTtsAudio();
+  if (!ctx || !blob) return false;
+  const arrayBuffer = await blob.arrayBuffer();
+  const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+  rememberDecodedAudio(key, decoded);
+  playAudioBuffer(decoded);
+  return true;
+}
 
-  const voice = bestVoiceFor(speechLang);
-  if (voice) utter.voice = voice;
+async function generateLocalTts(lang, value, { silent=false } = {}) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const key = localTtsKey(lang, text);
 
-  let started = false;
-  let fallbackStarted = false;
-  const fallbackOnce = () => {
-    if (fallbackStarted) return;
-    fallbackStarted = true;
-    speakWithFallback(value);
-  };
+  const cached = await getSavedLocalTts(key);
+  if (cached?.blob) return { key, blob:cached.blob, cached:true };
 
-  utter.onstart = () => { started = true; };
-  utter.onerror = event => {
-    const reason = String(event?.error || '').toLowerCase();
-    if (reason === 'canceled' || reason === 'interrupted') return;
-    console.warn('native speech failed', reason || event);
-    fallbackOnce();
-  };
+  if (localTtsInflight.has(key)) return localTtsInflight.get(key);
+
+  const task = (async () => {
+    const cfg = LOCAL_TTS_MODELS[lang] || LOCAL_TTS_MODELS.en;
+    const engineReady = localTtsEngine.lang === lang && !!localTtsEngine.pipe;
+    if (!silent && !engineReady) showToast(`首次准备${cfg.label}自然语音…`);
+    else if (!silent) showToast('正在生成本条语音…');
+
+    const pipe = await ensureLocalTtsEngine(lang);
+    const output = await pipe(text);
+    const samples = output?.audio ?? output?.data ?? output;
+    const sampleRate = output?.sampling_rate ?? output?.samplingRate ?? 16000;
+    if (!samples || !samples.length) throw new Error('语音模型没有返回音频');
+
+    const normalized = samples instanceof Float32Array ? samples : Float32Array.from(samples);
+    const blob = floatSamplesToWavBlob(normalized, sampleRate);
+    saveLocalTts(key, lang, text, blob);
+    return { key, blob, samples:normalized, sampleRate, cached:false };
+  })().finally(() => localTtsInflight.delete(key));
+
+  localTtsInflight.set(key, task);
+  return task;
+}
+
+async function speakText(text, lang=state.lang) {
+  const value = String(text || '').trim();
+  if (!value) { showToast('没有可聆听的内容'); return false; }
+
+  primeLocalTtsAudio();
+  stopLocalTtsAudio();
 
   try {
-    synth.resume?.();
-    if (synth.speaking || synth.pending) synth.cancel();
-    synth.speak(utter);
-
-    if (!voice) {
-      setTimeout(() => refreshSpeechVoices(), 120);
-      setTimeout(() => refreshSpeechVoices(), 500);
+    const key = localTtsKey(lang, value);
+    const decoded = localTtsDecoded.get(key);
+    if (decoded) {
+      playAudioBuffer(decoded);
+      return true;
     }
-    // 个别内核存在 speechSynthesis 对象但永远不触发 start/error；短暂等待后自动兜底。
-    setTimeout(() => {
-      if (!started && !fallbackStarted && !synth.speaking && !synth.pending) fallbackOnce();
-    }, 1200);
+
+    const result = await generateLocalTts(lang, value);
+    if (!result) return false;
+
+    // 新生成的音频直接使用 Float32Array 播放，避免再次解码，响应更快。
+    if (result.samples?.length) {
+      playFloatSamples(result.samples, result.sampleRate, result.key);
+      return true;
+    }
+
+    if (result.blob) {
+      await decodeAndPlaySavedLocalTts(result.key, result.blob);
+      return true;
+    }
+    return false;
   } catch (err) {
-    console.warn('speech synthesis failed', err);
-    fallbackOnce();
+    console.warn('local neural tts failed', err);
+    showToast('本地自然语音暂不可用，尝试系统语音');
+    return nativeSpeechFallback(value, lang);
   }
+}
+
+function prefetchLocalTtsText(text, lang=state.lang) {
+  const value = String(text || '').trim();
+  if (!value) return;
+  const key = localTtsKey(lang, value);
+  if (localTtsDecoded.has(key) || localTtsInflight.has(key)) return;
+  getSavedLocalTts(key).then(cached => {
+    if (cached?.blob) return;
+    generateLocalTts(lang, value, { silent:true }).catch(err => console.warn('tts prefetch failed', err));
+  });
+}
+
+function scheduleLocalTtsWarmup() {
+  clearTimeout(localTtsWarmTimer);
+  const hasSpeakButtons = !!document.querySelector('[data-speak]');
+  const shouldWarm = hasSpeakButtons || route.page === 'materials' || route.page === 'learn' || route.page === 'review';
+  if (!shouldWarm) return;
+
+  const lang = state.lang;
+  localTtsWarmTimer = setTimeout(async () => {
+    try {
+      await ensureLocalTtsEngine(lang);
+
+      // 当前页面最先出现的 1~2 条先静默生成。
+      // 单卡片页还会额外预生成“下一条”，这样切换后再点聆听通常更快。
+      const visible = [...document.querySelectorAll('[data-speak]')]
+        .slice(0, 2)
+        .map(el => {
+          try { return decodeURIComponent(el.dataset.speak || ''); }
+          catch { return el.dataset.speak || ''; }
+        })
+        .filter(Boolean);
+
+      const queue = [...visible];
+      if (route.page === 'materials') {
+        if (currentMaterialSpeechText) queue.unshift(currentMaterialSpeechText);
+        if (nextMaterialSpeechText) queue.push(nextMaterialSpeechText);
+      }
+
+      const unique = [...new Set(queue.map(x => String(x).trim()).filter(Boolean))].slice(0, 3);
+      for (const value of unique) {
+        await generateLocalTts(lang, value, { silent:true }).catch(()=>null);
+      }
+    } catch (err) {
+      console.warn('local tts warmup failed', err);
+    }
+  }, 320);
 }
 
 function currentLevel(lang=state.lang) {
@@ -11620,6 +11770,7 @@ function renderTopbar() {
 
 function render() {
   applyTheme(); renderTopbar(); renderNav();
+  if (route.page !== 'materials') { currentMaterialSpeechText = ''; nextMaterialSpeechText = ''; }
   const page = document.getElementById('page');
   if (route.page === 'home') page.innerHTML = homeHTML();
   else if (route.page === 'learn') page.innerHTML = route.lessonId ? lessonHTML(route.lessonId) : learnHTML();
@@ -11629,6 +11780,7 @@ function render() {
   else if (route.page === 'notes') page.innerHTML = notesHTML();
   else if (route.page === 'ai') page.innerHTML = aiHTML();
   bindPageEvents();
+  scheduleLocalTtsWarmup();
 }
 
 function homeHTML() {
@@ -11713,42 +11865,68 @@ function materialsHTML() {
     const q = materialSearch.trim().toLowerCase();
     items = items.filter(x => `${x.front} ${x.meaning} ${x.romanization||''} ${x.topic||''}`.toLowerCase().includes(q));
   }
+
   const countWord = all.filter(x=>x.type==='word').length;
   const countSentence = all.filter(x=>x.type==='sentence').length;
-  const visibleItems = items.slice(0, materialVisibleCount);
-  const hasMoreMaterials = items.length > visibleItems.length;
-  const isAdded = x => mine.some(m => m.type===x.type && String(m.front).trim()===String(x.front).trim());
+  if (!items.length) materialCurrentIndex = 0;
+  else materialCurrentIndex = Math.max(0, Math.min(materialCurrentIndex, items.length - 1));
+
+  const x = items[materialCurrentIndex] || null;
+  currentMaterialSpeechText = x?.front || '';
+  nextMaterialSpeechText = items[materialCurrentIndex + 1]?.front || '';
+  const isAdded = item => mine.some(m => m.type===item.type && String(m.front).trim()===String(item.front).trim());
+  const position = items.length ? `${(materialCurrentIndex + 1).toLocaleString()} / ${items.length.toLocaleString()}` : '0 / 0';
+
   return `<div class="materials-page">
     <button class="ghost small" data-nav="learn">‹ 返回学习</button>
     <div class="materials-head">
       <div class="home-kicker">${langInfo().code} · ${escapeHTML(currentLevel())}</div>
       <h1 class="page-title">词句学习库</h1>
-      <p class="page-subtitle">这里是主要学习资料：${countWord.toLocaleString()} 个单词 + ${countSentence.toLocaleString()} 个句子。资料很多，不需要一次学完；搜索、按主题筛选，遇到想重点记的再加入“今日复习”。</p>
+      <p class="page-subtitle">一次只学一个，使用“上一个 / 下一个”连续切换。也可以先筛选单词、句子或主题，再逐个学习。</p>
     </div>
+
     <input id="materialSearchInput" class="search" value="${escapeHTML(materialSearch)}" placeholder="搜索单词、句子或中文意思" />
+
     <div class="chips material-filter-row">
       <button class="chip ${materialFilter==='all'?'active':''}" data-material-filter="all">全部 ${all.length.toLocaleString()}</button>
       <button class="chip ${materialFilter==='word'?'active':''}" data-material-filter="word">单词 ${countWord.toLocaleString()}</button>
       <button class="chip ${materialFilter==='sentence'?'active':''}" data-material-filter="sentence">句子 ${countSentence.toLocaleString()}</button>
     </div>
+
     <div class="chips topic-row">
       <button class="chip ${materialTopic==='all'?'active':''}" data-material-topic="all">全部主题</button>
       ${topics.map(t=>`<button class="chip ${materialTopic===t?'active':''}" data-material-topic="${escapeHTML(t)}">${escapeHTML(t)}</button>`).join('')}
     </div>
-    <div class="material-list">
-      ${items.length ? visibleItems.map((x,i)=>`<article class="material-card">
+
+    ${x ? `<section class="material-study-shell">
+      <div class="material-study-status">
+        <span>${x.type==='word'?'单词':'句子'} · ${escapeHTML(x.topic||'常用')}</span>
+        <strong>${position}</strong>
+      </div>
+
+      <article class="material-card material-card-single">
         <div class="material-card-top">
           <span class="material-type">${x.type==='word'?'单词':'句子'} · ${escapeHTML(x.topic||'常用')}</span>
           <button class="speak-button" type="button" data-speak="${encodeURIComponent(x.front)}">🔊 聆听</button>
         </div>
-        <div class="material-front">${escapeHTML(x.front)}</div>
-        ${x.romanization?`<div class="romanization">${pronunciationLabel()}：${escapeHTML(x.romanization)}</div>`:''}
-        <div class="material-meaning">${escapeHTML(x.meaning)}</div>
+
+        <div class="material-front material-front-single">${escapeHTML(x.front)}</div>
+        ${x.romanization?`<div class="romanization material-romanization-single">${pronunciationLabel()}：${escapeHTML(x.romanization)}</div>`:''}
+        <div class="material-meaning material-meaning-single">${escapeHTML(x.meaning)}</div>
         ${x.source?`<div class="material-source">来源：${escapeHTML(x.source)}</div>`:''}
-        <button class="${isAdded(x)?'ghost':'secondary'} small material-add" data-material-index="${all.indexOf(x)}" ${isAdded(x)?'disabled':''}>${isAdded(x)?'✓ 已在复习':'＋ 加入复习'}</button>
-      </article>`).join('') : '<div class="empty">没有找到匹配内容。</div>'}
-    </div>
-    ${hasMoreMaterials?`<button id="loadMoreMaterials" class="secondary wide material-load-more">再显示 ${Math.min(40, items.length-visibleItems.length)} 条</button>`:''}
+
+        <div class="material-single-actions">
+          <button class="${isAdded(x)?'ghost':'secondary'} material-add" data-material-index="${all.indexOf(x)}" ${isAdded(x)?'disabled':''}>${isAdded(x)?'✓ 已在复习':'＋ 加入复习'}</button>
+        </div>
+      </article>
+
+      <div class="material-pager">
+        <button id="prevMaterial" class="secondary material-page-button" ${materialCurrentIndex<=0?'disabled':''}>← 上一个</button>
+        <span class="material-page-counter">${position}</span>
+        <button id="nextMaterial" class="primary material-page-button" ${materialCurrentIndex>=items.length-1?'disabled':''}>下一个 →</button>
+      </div>
+    </section>` : '<div class="empty material-empty-single">没有找到匹配内容，请换一个关键词或筛选条件。</div>'}
+
     <div class="library-attribution">资料来源包含开放词汇/语料：Open Yonsei Korean Vocabulary、ECDICT、LEXiTRON 2.0、Tatoeba。不同来源遵循各自许可；完整说明见 SOURCES.md。</div>
   </div>`;
 }
@@ -11843,17 +12021,31 @@ function bindPageEvents() {
   document.getElementById('wordSearch')?.addEventListener('input',e=>{searchText=e.target.value; render(); document.getElementById('wordSearch')?.focus();});
   document.getElementById('noteSearch')?.addEventListener('input',e=>{searchText=e.target.value; render(); document.getElementById('noteSearch')?.focus();});
   document.querySelectorAll('[data-filter]').forEach(el=>el.onclick=()=>{wordFilter=el.dataset.filter;render();});
-  document.getElementById('materialSearchInput')?.addEventListener('input',e=>{materialSearch=e.target.value;materialVisibleCount=40;render();document.getElementById('materialSearchInput')?.focus();});
-  document.querySelectorAll('[data-material-filter]').forEach(el=>el.onclick=()=>{materialFilter=el.dataset.materialFilter;materialVisibleCount=40;render();});
-  document.querySelectorAll('[data-material-topic]').forEach(el=>el.onclick=()=>{materialTopic=el.dataset.materialTopic;materialVisibleCount=40;render();});
-  document.getElementById('loadMoreMaterials')?.addEventListener('click',()=>{materialVisibleCount+=40;render();requestAnimationFrame(()=>document.getElementById('loadMoreMaterials')?.scrollIntoView({block:'nearest'}));});
+  document.getElementById('materialSearchInput')?.addEventListener('input',e=>{materialSearch=e.target.value;materialCurrentIndex=0;render();document.getElementById('materialSearchInput')?.focus();});
+  document.querySelectorAll('[data-material-filter]').forEach(el=>el.onclick=()=>{materialFilter=el.dataset.materialFilter;materialCurrentIndex=0;render();});
+  document.querySelectorAll('[data-material-topic]').forEach(el=>el.onclick=()=>{materialTopic=el.dataset.materialTopic;materialCurrentIndex=0;render();});
+  document.getElementById('prevMaterial')?.addEventListener('click',()=>{if(materialCurrentIndex>0){materialCurrentIndex--;render();}});
+  document.getElementById('nextMaterial')?.addEventListener('click',()=>{materialCurrentIndex++;render();});
   document.querySelectorAll('[data-material-index]').forEach(el=>el.onclick=()=>{const bank=currentMaterialBank();const x=bank[Number(el.dataset.materialIndex)];if(!x)return;addStudyItem(x.type,x.front,x.meaning,`内置词句库 · ${x.topic||''}`,x.romanization||'');showToast('已加入今日复习');render();});
   document.getElementById('lessonNote')?.addEventListener('input',e=>{ const id=route.lessonId; state.progress[state.lang].lessonNotes[id]=e.target.value; saveState(); });
   document.getElementById('toggleDone')?.addEventListener('click',e=>{ const id=e.currentTarget.dataset.lessonId; const arr=state.progress[state.lang].completed; const i=arr.indexOf(id); i>=0?arr.splice(i,1):arr.push(id); saveState(); showToast(i>=0?'已取消完成':'已记录学习完成'); render(); });
   document.querySelectorAll('[data-save-example-front]').forEach(el=>el.onclick=()=>{ const front=decodeURIComponent(el.dataset.saveExampleFront), meaning=decodeURIComponent(el.dataset.saveExampleMeaning), romanization=decodeURIComponent(el.dataset.saveExampleRomanization||''); addStudyItem('sentence',front,meaning,'',romanization); showToast('已加入复习'); });
   document.getElementById('checkQuiz')?.addEventListener('click',e=>{ const ans=decodeURIComponent(e.currentTarget.dataset.answer); const mine=document.getElementById('quizAnswer').value.trim(); document.getElementById('quizFeedback').innerHTML= mine ? `参考答案：<strong>${escapeHTML(ans)}</strong><br>你的答案：${escapeHTML(mine)}` : `参考答案：<strong>${escapeHTML(ans)}</strong>`; });
   document.querySelectorAll('[data-ask-ai]').forEach(el=>el.onclick=()=>{ const prompt=decodeURIComponent(el.dataset.askAi); route={page:'ai',lessonId:null}; render(); setTimeout(()=>sendAI(prompt),50); });
-  document.querySelectorAll('[data-speak]').forEach(el=>el.onclick=e=>{ e.preventDefault(); e.stopPropagation(); speakText(decodeURIComponent(el.dataset.speak)); });
+  document.querySelectorAll('[data-speak]').forEach(el=>el.onclick=async e=>{
+    e.preventDefault(); e.stopPropagation();
+    const value = decodeURIComponent(el.dataset.speak || '');
+    const oldHTML = el.innerHTML;
+    el.disabled = true;
+    el.classList.add('speech-loading');
+    el.innerHTML = '🔊 准备中…';
+    try { await speakText(value, state.lang); }
+    finally {
+      el.disabled = false;
+      el.classList.remove('speech-loading');
+      el.innerHTML = oldHTML;
+    }
+  });
   document.getElementById('revealMeaning')?.addEventListener('click',()=>{ document.getElementById('reviewMeaning').hidden=false; document.getElementById('reviewActions').hidden=false; document.getElementById('revealMeaning').hidden=true; });
   document.querySelectorAll('[data-review]').forEach(el=>el.onclick=()=>rateReview(el.dataset.itemId,el.dataset.review));
   document.querySelector('[data-edit-review-item]')?.addEventListener('click',e=>openItemModal(e.currentTarget.dataset.editReviewItem));
@@ -11870,7 +12062,7 @@ function navigate(page) {
   searchText='';
   if (page==='learn' || page==='materials') ensureMaterialBank(state.lang);
   if (page !== 'materials') materialSearch='';
-  if (page === 'materials') materialVisibleCount=40;
+  if (page === 'materials') { materialVisibleCount=40; materialCurrentIndex=0; }
   if (page === 'review') startReviewSession();
   else if (route.page === 'review') reviewSession = null;
   route={page,lessonId:null};
@@ -12101,8 +12293,6 @@ if ('serviceWorker' in navigator && (location.protocol==='https:' || location.ho
   window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));
 }
 
-warmSpeechVoices();
-warmFallbackTTS();
 ensureMaterialBank(state.lang);
 render();
 handleOpenRouterCallback();
