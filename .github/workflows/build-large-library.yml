@@ -1,0 +1,48 @@
+name: Build Study Large Library
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-library:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: study_cloudbase_free/package.json
+
+      - name: Install dependencies
+        working-directory: study_cloudbase_free
+        run: npm install
+
+      - name: Build full Korean English Thai library
+        working-directory: study_cloudbase_free
+        run: npm run build
+
+      - name: Show generated library sizes
+        run: |
+          du -sh study_cloudbase_free/dist || true
+          ls -lh study_cloudbase_free/dist/data || true
+
+      - name: Commit prebuilt site back to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f study_cloudbase_free/dist
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit."
+          else
+            git commit -m "Build full Study language library"
+            git push
+          fi
