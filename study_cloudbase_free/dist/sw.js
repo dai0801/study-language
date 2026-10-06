@@ -1,4 +1,4 @@
-const CACHE = 'study-v3.2.0-mobile-speech';
+const CACHE = 'study-v3.4.0-universal-mobile-tts';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.json', './icon.svg'];
 
 self.addEventListener('install', event => {
