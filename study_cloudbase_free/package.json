@@ -1,0 +1,12 @@
+{
+  "name": "study-language",
+  "version": "3.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"build": "node build.mjs", "build:offline": "SKIP_REMOTE_DATA=1 node build.mjs"},
+  "dependencies": {
+    "@pcampus/thai-romanization": "^1.0.0",
+    "csv-parse": "^6.1.0",
+    "unbzip2-stream": "^1.4.3"
+  }
+}

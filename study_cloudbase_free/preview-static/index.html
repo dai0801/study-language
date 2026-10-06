@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f7f6f2" />
+  <meta name="description" content="个人韩语、英语、泰语学习网站" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="styles.css" />
+  <title>Study — 我的语言学习</title>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="desktop-sidebar" aria-label="主导航">
+      <div class="brand">Study<span class="brand-dot">.</span></div>
+      <nav id="desktopNav" class="side-nav"></nav>
+      <div class="sidebar-foot">只为自己学习<br><span>数据保存在本机</span></div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <button id="languageButton" class="language-button" aria-haspopup="true" aria-expanded="false"></button>
+        <button id="settingsButton" class="icon-button" aria-label="设置">⚙</button>
+      </header>
+
+      <section id="page" class="page"></section>
+    </main>
+
+    <nav id="mobileNav" class="mobile-nav" aria-label="底部导航"></nav>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

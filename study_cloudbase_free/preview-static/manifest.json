@@ -1,0 +1,12 @@
+{
+  "name": "Study — 我的语言学习",
+  "short_name": "Study",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f6f5f1",
+  "theme_color": "#f6f5f1",
+  "description": "个人韩语、英语、泰语学习网站",
+  "icons": [
+    {"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+  ]
+}
