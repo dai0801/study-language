@@ -1,0 +1,52 @@
+{
+  "version": "3.1.0",
+  "builtAt": "2026-10-06T10:47:59.317Z",
+  "libraries": {
+    "ko": {
+      "lang": "ko",
+      "generatedAt": "2026-10-06T10:48:05.514Z",
+      "count": 6744,
+      "words": 4115,
+      "sentences": 2629,
+      "errors": []
+    },
+    "en": {
+      "lang": "en",
+      "generatedAt": "2026-10-06T10:48:23.127Z",
+      "count": 14668,
+      "words": 12048,
+      "sentences": 2620,
+      "errors": []
+    },
+    "th": {
+      "lang": "th",
+      "generatedAt": "2026-10-06T10:49:03.766Z",
+      "count": 18694,
+      "words": 18494,
+      "sentences": 200,
+      "errors": []
+    }
+  },
+  "sources": [
+    {
+      "name": "Open Yonsei Korean Vocabulary",
+      "license": "CC BY-SA 3.0",
+      "url": "https://github.com/sugalhjk-tech/yonsei-korean-vocabulary"
+    },
+    {
+      "name": "ECDICT",
+      "license": "Open-source project; see upstream license/provenance",
+      "url": "https://github.com/skywind3000/ECDICT"
+    },
+    {
+      "name": "LEXiTRON 2.0",
+      "license": "Open Data Common",
+      "url": "https://opend.nstda.or.th/en/dataset/lexitron-2-0"
+    },
+    {
+      "name": "Tatoeba",
+      "license": "CC BY 2.0 FR / some CC0",
+      "url": "https://tatoeba.org/en/downloads"
+    }
+  ]
+}
