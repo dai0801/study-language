@@ -11426,7 +11426,7 @@ function ensureFallbackTTS() {
     const tts = new globalThis.SimpleTTS({
       workerPath: workerUrl,
       defaultVoice: 'en',
-      defaultRate: 165,
+      defaultRate: 210,
       defaultPitch: 50,
       defaultVolume: 1,
       enhanceAudio: false
@@ -11481,7 +11481,7 @@ async function speakWithFallback(value, { announce=true } = {}) {
   try {
     const tts = await ensureFallbackTTS();
     const voice = FALLBACK_SPEECH_VOICES[state.lang] || 'en';
-    const rate = 175;
+    const rate = 210;
     tts.speak(value, { voice, rate, pitch:50, volume:1, enhance:false }, (audioData, sampleRate) => {
       try { playFallbackSamples(audioData, sampleRate); }
       catch (err) { console.warn('fallback playback failed', err); showToast('备用语音生成成功，但当前浏览器阻止了播放'); }
