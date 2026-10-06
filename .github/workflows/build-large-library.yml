@@ -74,19 +74,78 @@ jobs:
           npm install
           npm run build
           rm -rf dist/tts
+          rm -rf dist/audio
       - uses: actions/upload-artifact@v4
         with:
           name: base-dist
           path: study_cloudbase_free/dist
           retention-days: 1
 
-  tts:
+  plan-tts:
     if: ${{ inputs.mode == 'full-audio' || inputs.mode == 'smoke-audio' }}
     needs: build-data
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: base-dist
+          path: study_cloudbase_free/dist
+      - id: plan
+        name: Plan parallel TTS chunks
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          dist = Path("study_cloudbase_free/dist")
+          mode = os.environ["MODE"]
+          chunk_size = 2400
+          include = []
+
+          for lang in ("ko","en","th"):
+              payload = json.loads((dist/"data"/f"{lang}.json").read_text("utf-8"))
+              items = payload.get("items", payload if isinstance(payload, list) else [])
+              seen = set()
+              total = 0
+              for item in items:
+                  text = " ".join(str(item.get("front","")).split()).strip()
+                  if not text or text in seen:
+                      continue
+                  seen.add(text)
+                  total += 1
+
+              if mode == "smoke-audio":
+                  include.append({"lang":lang,"batch":"000","offset":0,"limit":12})
+              else:
+                  batch = 0
+                  for offset in range(0, total, chunk_size):
+                      include.append({
+                          "lang": lang,
+                          "batch": f"{batch:03d}",
+                          "offset": offset,
+                          "limit": min(chunk_size, total-offset)
+                      })
+                      batch += 1
+
+              print(f"{lang}: {total} unique texts")
+
+          matrix = json.dumps({"include":include}, separators=(",",":"))
+          print("matrix jobs:", len(include))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("matrix=" + matrix + "\n")
+          PY
+
+  tts:
+    if: ${{ inputs.mode == 'full-audio' || inputs.mode == 'smoke-audio' }}
+    needs: [build-data, plan-tts]
     strategy:
       fail-fast: false
-      matrix:
-        lang: [ko, en, th]
+      max-parallel: 6
+      matrix: ${{ fromJson(needs.plan-tts.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -170,9 +229,11 @@ jobs:
               ap = argparse.ArgumentParser()
               ap.add_argument("--lang", choices=["ko","en","th"], required=True)
               ap.add_argument("--dist", required=True)
+              ap.add_argument("--part-dir", required=True)
+              ap.add_argument("--offset", type=int, default=0)
+              ap.add_argument("--limit", type=int, default=0)
               ap.add_argument("--shard-size", type=int, default=60)
               ap.add_argument("--bitrate", default="32k")
-              ap.add_argument("--limit", type=int, default=0)
               args = ap.parse_args()
           
               torch.set_num_threads(max(1, min(4, os.cpu_count() or 2)))
@@ -197,10 +258,12 @@ jobs:
                   seen.add(key)
                   unique.append((key, text))
           
-              if args.limit:
-                  unique = unique[:args.limit]
+              total = len(unique)
+              start = max(0, args.offset)
+              end = total if args.limit <= 0 else min(total, start + args.limit)
+              selected = unique[start:end]
           
-              out_dir = dist / "audio" / args.lang
+              out_dir = Path(args.part_dir)
               out_dir.mkdir(parents=True, exist_ok=True)
           
               model_id = MODELS[args.lang]
@@ -209,16 +272,17 @@ jobs:
               model = VitsModel.from_pretrained(model_id)
               model.eval()
               rate = int(model.config.sampling_rate)
-              print(f"[{args.lang}] {len(unique)} texts, sample rate {rate}", flush=True)
+              print(f"[{args.lang}] full={total}, range={start}:{end}, selected={len(selected)}, rate={rate}", flush=True)
           
               manifest = {}
               pre = np.zeros(int(rate * 0.045), dtype=np.float32)
               gap = np.zeros(int(rate * 0.115), dtype=np.float32)
               shard_size = max(1, args.shard_size)
+              global_shard_start = start // shard_size
           
-              for shard_no, start_idx in enumerate(range(0, len(unique), shard_size)):
-                  group = unique[start_idx:start_idx+shard_size]
-                  filename = f"s{shard_no:04d}.m4a"
+              for local_shard_no, start_idx in enumerate(range(0, len(selected), shard_size)):
+                  group = selected[start_idx:start_idx+shard_size]
+                  filename = f"s{global_shard_start + local_shard_no:05d}.m4a"
                   parts, cursor, ok = [], 0.0, 0
           
                   for local_idx, (key, text) in enumerate(group):
@@ -238,9 +302,9 @@ jobs:
                       except Exception as exc:
                           print(f"[{args.lang}] skip {text[:60]!r}: {exc}", flush=True)
           
-                      done = start_idx + local_idx + 1
-                      if done % 25 == 0 or done == len(unique):
-                          print(f"[{args.lang}] generated {done}/{len(unique)}", flush=True)
+                      done = start + start_idx + local_idx + 1
+                      if (local_idx + 1) % 25 == 0 or (start_idx + local_idx + 1) == len(selected):
+                          print(f"[{args.lang}] generated {done}/{total}", flush=True)
           
                   if parts:
                       merged = np.concatenate(parts)
@@ -251,12 +315,14 @@ jobs:
                       print(f"[{args.lang}] {filename}: {ok} clips, {cursor:.1f}s", flush=True)
           
               meta = {
-                  "version": "3.7.2",
+                  "version": "3.7.3-part",
                   "lang": args.lang,
                   "model": model_id,
                   "codec": "AAC-LC",
                   "bitrate": args.bitrate,
-                  "shardSize": shard_size,
+                  "offset": start,
+                  "end": end,
+                  "total": total,
                   "count": len(manifest),
                   "items": manifest,
               }
@@ -264,85 +330,123 @@ jobs:
                   json.dumps(meta, ensure_ascii=False, separators=(",",":")),
                   "utf-8"
               )
-              print(f"[{args.lang}] done: {len(manifest)} entries", flush=True)
+              print(f"[{args.lang}] part done: {len(manifest)} entries", flush=True)
           
           if __name__ == "__main__":
               main()
           PY
           python -m py_compile /tmp/generate_static_tts.py
-          echo "Generator ready:"
-          ls -lh /tmp/generate_static_tts.py
 
-      - name: Generate ${{ matrix.lang }} static audio
+      - name: Generate ${{ matrix.lang }} batch ${{ matrix.batch }}
         shell: bash
         run: |
-          EXTRA=""
-          if [ "${{ inputs.mode }}" = "smoke-audio" ]; then
-            EXTRA="--limit 12"
-          fi
-
-          python /tmp/generate_static_tts.py             --lang ${{ matrix.lang }}             --dist study_cloudbase_free/dist             --shard-size 60             --bitrate 32k             $EXTRA
+          mkdir -p "tts-part/${{ matrix.lang }}/${{ matrix.batch }}"
+          python /tmp/generate_static_tts.py             --lang ${{ matrix.lang }}             --dist study_cloudbase_free/dist             --part-dir "tts-part/${{ matrix.lang }}/${{ matrix.batch }}"             --offset ${{ matrix.offset }}             --limit ${{ matrix.limit }}             --shard-size 60             --bitrate 32k
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tts-${{ matrix.lang }}
-          path: study_cloudbase_free/dist/audio/${{ matrix.lang }}
+          name: tts-${{ matrix.lang }}-${{ matrix.batch }}
+          path: tts-part/${{ matrix.lang }}/${{ matrix.batch }}
           retention-days: 1
 
   smoke-result:
     if: ${{ inputs.mode == 'smoke-audio' }}
-    needs: [build-data, tts]
+    needs: [build-data, plan-tts, tts]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: tts-ko
-          path: smoke/audio/ko
-      - uses: actions/download-artifact@v4
-        with:
-          name: tts-en
-          path: smoke/audio/en
-      - uses: actions/download-artifact@v4
-        with:
-          name: tts-th
-          path: smoke/audio/th
+          pattern: tts-*
+          path: smoke-parts
       - name: Verify three-language smoke audio
         run: |
-          test -f smoke/audio/ko/manifest.json
-          test -f smoke/audio/en/manifest.json
-          test -f smoke/audio/th/manifest.json
-          echo "Korean files:"
-          find smoke/audio/ko -maxdepth 1 -type f -printf "%f\n"
-          echo "English files:"
-          find smoke/audio/en -maxdepth 1 -type f -printf "%f\n"
-          echo "Thai files:"
-          find smoke/audio/th -maxdepth 1 -type f -printf "%f\n"
+          echo "Downloaded smoke artifacts:"
+          find smoke-parts -maxdepth 3 -type f -printf "%p\n"
+          test -f smoke-parts/tts-ko-000/manifest.json
+          test -f smoke-parts/tts-en-000/manifest.json
+          test -f smoke-parts/tts-th-000/manifest.json
           echo "SMOKE TEST PASSED"
 
   merge:
     if: ${{ inputs.mode == 'full-audio' }}
-    needs: [build-data, tts]
+    needs: [build-data, plan-tts, tts]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           name: base-dist
           path: study_cloudbase_free/dist
+
       - uses: actions/download-artifact@v4
         with:
-          name: tts-ko
-          path: study_cloudbase_free/dist/audio/ko
-      - uses: actions/download-artifact@v4
-        with:
-          name: tts-en
-          path: study_cloudbase_free/dist/audio/en
-      - uses: actions/download-artifact@v4
-        with:
-          name: tts-th
-          path: study_cloudbase_free/dist/audio/th
+          pattern: tts-*
+          path: tts-parts
+
+      - name: Merge all audio parts
+        run: |
+          python - <<'PY'
+          import json, shutil
+          from pathlib import Path
+
+          root = Path("tts-parts")
+          dist_audio = Path("study_cloudbase_free/dist/audio")
+          if dist_audio.exists():
+              shutil.rmtree(dist_audio)
+          dist_audio.mkdir(parents=True, exist_ok=True)
+
+          for lang in ("ko","en","th"):
+              out = dist_audio/lang
+              out.mkdir(parents=True, exist_ok=True)
+              items = {}
+              model = None
+              bitrate = "32k"
+              total = 0
+
+              manifests = sorted(root.glob(f"tts-{lang}-*/manifest.json"))
+              if not manifests:
+                  raise SystemExit(f"No manifests found for {lang}")
+
+              for mf in manifests:
+                  meta = json.loads(mf.read_text("utf-8"))
+                  model = model or meta.get("model")
+                  bitrate = meta.get("bitrate", bitrate)
+                  total = max(total, int(meta.get("total",0)))
+                  for src in mf.parent.glob("*.m4a"):
+                      dst = out/src.name
+                      if dst.exists():
+                          raise SystemExit(f"Duplicate shard: {dst}")
+                      shutil.copy2(src, dst)
+                  overlap = set(items).intersection(meta.get("items",{}))
+                  if overlap:
+                      raise SystemExit(f"Duplicate manifest keys for {lang}: {len(overlap)}")
+                  items.update(meta.get("items",{}))
+
+              merged = {
+                  "version":"3.7.3",
+                  "lang":lang,
+                  "model":model,
+                  "codec":"AAC-LC",
+                  "bitrate":bitrate,
+                  "count":len(items),
+                  "total":total,
+                  "items":items
+              }
+              (out/"manifest.json").write_text(
+                  json.dumps(merged, ensure_ascii=False, separators=(",",":")),
+                  "utf-8"
+              )
+              print(f"{lang}: merged {len(manifests)} parts, {len(items)} entries")
+          PY
+
+      - name: Show final audio size
+        run: |
+          du -sh study_cloudbase_free/dist/audio
+          find study_cloudbase_free/dist/audio -name "*.m4a" | wc -l
+
       - name: Commit complete dist
         run: |
           git config user.name "github-actions[bot]"
