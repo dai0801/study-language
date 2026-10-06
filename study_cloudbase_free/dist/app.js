@@ -11481,7 +11481,7 @@ async function speakWithFallback(value, { announce=true } = {}) {
   try {
     const tts = await ensureFallbackTTS();
     const voice = FALLBACK_SPEECH_VOICES[state.lang] || 'en';
-    const rate = state.lang === 'en' ? 165 : 150;
+    const rate = 175;
     tts.speak(value, { voice, rate, pitch:50, volume:1, enhance:false }, (audioData, sampleRate) => {
       try { playFallbackSamples(audioData, sampleRate); }
       catch (err) { console.warn('fallback playback failed', err); showToast('备用语音生成成功，但当前浏览器阻止了播放'); }
@@ -11519,7 +11519,7 @@ function speakText(text) {
   }
 
   utter.lang = speechLang;
-  utter.rate = state.lang === 'en' ? 0.94 : 0.88;
+  utter.rate = 1.0;
   utter.pitch = 1;
   utter.volume = 1;
 
