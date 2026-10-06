@@ -1,10 +1,10 @@
 {
   "version": "3.1.0",
-  "builtAt": "2026-10-06T10:47:59.317Z",
+  "builtAt": "2026-10-06T11:29:16.534Z",
   "libraries": {
     "ko": {
       "lang": "ko",
-      "generatedAt": "2026-10-06T10:48:05.514Z",
+      "generatedAt": "2026-10-06T11:29:21.265Z",
       "count": 6744,
       "words": 4115,
       "sentences": 2629,
@@ -12,7 +12,7 @@
     },
     "en": {
       "lang": "en",
-      "generatedAt": "2026-10-06T10:48:23.127Z",
+      "generatedAt": "2026-10-06T11:29:44.749Z",
       "count": 14668,
       "words": 12048,
       "sentences": 2620,
@@ -20,7 +20,7 @@
     },
     "th": {
       "lang": "th",
-      "generatedAt": "2026-10-06T10:49:03.766Z",
+      "generatedAt": "2026-10-06T11:30:32.497Z",
       "count": 18694,
       "words": 18494,
       "sentences": 200,

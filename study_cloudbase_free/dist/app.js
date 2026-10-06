@@ -11311,22 +11311,58 @@ function aiProviderInfo() { return AI_PROVIDERS[state.ai.provider] || AI_PROVIDE
 const SPEECH_LANGS = { ko:'ko-KR', en:'en-US', th:'th-TH' };
 let speechVoices = [];
 let speechVoiceCache = {};
+let speechWarmTimer = null;
+
+function speechAPI() {
+  const synth = window.speechSynthesis || globalThis.speechSynthesis || null;
+  const Utterance = window.SpeechSynthesisUtterance || globalThis.SpeechSynthesisUtterance || null;
+  return { synth, Utterance };
+}
+
+function refreshSpeechVoices() {
+  const { synth } = speechAPI();
+  if (!synth || typeof synth.getVoices !== 'function') return [];
+  try {
+    const voices = synth.getVoices() || [];
+    if (voices.length) {
+      speechVoices = voices;
+      speechVoiceCache = {};
+    }
+    return voices;
+  } catch {
+    return [];
+  }
+}
 
 function warmSpeechVoices() {
-  if (!('speechSynthesis' in window)) return;
-  const update = () => { speechVoices = window.speechSynthesis.getVoices?.() || []; speechVoiceCache = {}; };
-  update();
-  window.speechSynthesis.addEventListener?.('voiceschanged', update);
+  const { synth } = speechAPI();
+  if (!synth) return;
+  refreshSpeechVoices();
+  const update = () => refreshSpeechVoices();
+  // 不同手机内核触发方式不同：事件 + 短轮询一起做，避免把“语音列表尚未加载”误判成不支持。
+  if (typeof synth.addEventListener === 'function') synth.addEventListener('voiceschanged', update);
+  else if ('onvoiceschanged' in synth) synth.onvoiceschanged = update;
+  let attempts = 0;
+  clearInterval(speechWarmTimer);
+  speechWarmTimer = setInterval(() => {
+    attempts += 1;
+    const voices = refreshSpeechVoices();
+    if (voices.length || attempts >= 12) {
+      clearInterval(speechWarmTimer);
+      speechWarmTimer = null;
+    }
+  }, 250);
 }
 
 function bestVoiceFor(langCode) {
   if (speechVoiceCache[langCode]) return speechVoiceCache[langCode];
   const prefix = langCode.slice(0,2).toLowerCase();
-  const list = speechVoices.length ? speechVoices : (window.speechSynthesis?.getVoices?.() || []);
+  const live = refreshSpeechVoices();
+  const list = live.length ? live : speechVoices;
   const candidates = list.filter(v => String(v.lang || '').toLowerCase().startsWith(prefix));
   const chosen = candidates.find(v => v.localService && String(v.lang).toLowerCase() === langCode.toLowerCase())
-    || candidates.find(v => v.localService)
     || candidates.find(v => String(v.lang).toLowerCase() === langCode.toLowerCase())
+    || candidates.find(v => v.localService)
     || candidates[0]
     || null;
   if (chosen) speechVoiceCache[langCode] = chosen;
@@ -11336,29 +11372,57 @@ function bestVoiceFor(langCode) {
 function speakText(text) {
   const value = String(text || '').trim();
   if (!value) { showToast('没有可聆听的内容'); return; }
-  if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
-    showToast('当前浏览器暂不支持聆听');
+
+  const { synth, Utterance } = speechAPI();
+  // 手机端不再用 “'speechSynthesis' in window + 全局构造器” 的严格判断；部分内核只挂在 window 上。
+  if (!synth || typeof synth.speak !== 'function' || typeof Utterance !== 'function') {
+    showToast('当前手机内核没有开放系统朗读接口');
     return;
   }
-  const synth = window.speechSynthesis;
+
   const speechLang = SPEECH_LANGS[state.lang] || 'en-US';
-  const utter = new SpeechSynthesisUtterance(value);
+  let utter;
+  try { utter = new Utterance(value); }
+  catch {
+    showToast('系统朗读初始化失败，请重新打开页面再试');
+    return;
+  }
+
   utter.lang = speechLang;
-  utter.rate = state.lang === 'en' ? 0.92 : 0.86;
+  utter.rate = state.lang === 'en' ? 0.94 : 0.88;
   utter.pitch = 1;
+  utter.volume = 1;
+
+  // getVoices() 在很多手机上首次会返回空数组。空数组不代表不能读：让系统按 lang 自动选默认语音即可。
   const voice = bestVoiceFor(speechLang);
   if (voice) utter.voice = voice;
+
+  let started = false;
+  utter.onstart = () => { started = true; };
   utter.onerror = event => {
     const reason = String(event?.error || '').toLowerCase();
     if (reason === 'canceled' || reason === 'interrupted') return;
+    if (!started && (reason === 'not-allowed' || reason === 'audio-busy')) {
+      showToast('请再点一次“聆听”以允许手机播放语音');
+      return;
+    }
     showToast(`当前设备的${langInfo().name}语音暂不可用`);
   };
-  // 语音列表在页面加载时预热。没有旧语音时直接播放；只有正在播时才取消后切换。
-  if (synth.speaking || synth.pending) {
-    synth.cancel();
-    requestAnimationFrame(() => synth.speak(utter));
-  } else {
+
+  try {
+    // 某些 Android / iOS 内核暂停过 synthesis，需要先 resume；保持在用户点击事件内直接 speak，减少移动端延迟。
+    synth.resume?.();
+    if (synth.speaking || synth.pending) synth.cancel();
     synth.speak(utter);
+
+    // 部分手机第一次点击后才异步加载 voice；后台刷新，不阻塞本次朗读。
+    if (!voice) {
+      setTimeout(() => refreshSpeechVoices(), 120);
+      setTimeout(() => refreshSpeechVoices(), 500);
+    }
+  } catch (err) {
+    console.warn('speech synthesis failed', err);
+    showToast('系统朗读启动失败，请刷新页面后再试');
   }
 }
 
