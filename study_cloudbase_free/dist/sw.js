@@ -1,4 +1,4 @@
-const CACHE = 'study-v3.6-single-card-fast-local-tts';
+const CACHE = 'study-v3.7-static-audio';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.json', './icon.svg', './SOURCES.md'];
 
 self.addEventListener('install', event => {
@@ -9,9 +9,7 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   event.waitUntil(Promise.all([
     caches.keys().then(keys => Promise.all(
-      keys
-        .filter(k => k.startsWith('study-v') && k !== CACHE)
-        .map(k => caches.delete(k))
+      keys.filter(k => k.startsWith('study-v') && k !== CACHE).map(k => caches.delete(k))
     )),
     self.clients.claim()
   ]));
@@ -20,10 +18,10 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
-
-  // Hugging Face / jsDelivr 等跨域模型文件交给浏览器与 Transformers.js 自己缓存，
-  // 避免被 Study 的 service worker 重复存储或在升级时误删。
   if (url.origin !== self.location.origin) return;
+
+  // Audio sprites are already CDN/HTTP cached; do not duplicate large audio in CacheStorage.
+  if (url.pathname.includes('/audio/')) return;
 
   event.respondWith(
     fetch(event.request)

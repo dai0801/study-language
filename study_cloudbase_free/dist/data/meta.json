@@ -1,10 +1,10 @@
 {
   "version": "3.3.0",
-  "builtAt": "2026-10-06T14:12:26.981Z",
+  "builtAt": "2026-10-06T23:40:08.480Z",
   "libraries": {
     "ko": {
       "lang": "ko",
-      "generatedAt": "2026-10-06T14:12:32.484Z",
+      "generatedAt": "2026-10-06T23:40:12.706Z",
       "count": 6744,
       "words": 4115,
       "sentences": 2629,
@@ -12,7 +12,7 @@
     },
     "en": {
       "lang": "en",
-      "generatedAt": "2026-10-06T14:13:00.350Z",
+      "generatedAt": "2026-10-06T23:40:35.420Z",
       "count": 14668,
       "words": 12048,
       "sentences": 2620,
@@ -20,13 +20,11 @@
     },
     "th": {
       "lang": "th",
-      "generatedAt": "2026-10-06T14:13:03.368Z",
-      "count": 525,
-      "words": 325,
+      "generatedAt": "2026-10-06T23:42:49.842Z",
+      "count": 18694,
+      "words": 18494,
       "sentences": 200,
-      "errors": [
-        "words: 502 Bad Gateway: https://opend.nstda.or.th/api/3/action/package_show?id=lexitron-2-0"
-      ]
+      "errors": []
     }
   },
   "sources": [

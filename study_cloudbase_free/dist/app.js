@@ -11278,6 +11278,10 @@ let materialFilter = 'all';
 let materialTopic = 'all';
 let materialSearch = '';
 let materialVisibleCount = 40;
+let materialCurrentIndex = 0;
+let materialFiltersExpanded = false;
+let currentMaterialSpeechText = '';
+let nextMaterialSpeechText = '';
 let reviewSession = null;
 
 // V3.1 大资料库：部署构建时会把开放数据源整理成本地 JSON。
@@ -11309,259 +11313,126 @@ function langInfo() { return LANGS[state.lang]; }
 function aiProviderInfo() { return AI_PROVIDERS[state.ai.provider] || AI_PROVIDERS.openrouter; }
 
 
-const LOCAL_TTS_MODELS = {
-  ko: { id:'Xenova/mms-tts-kor', label:'韩语' },
-  en: { id:'Xenova/mms-tts-eng', label:'英语' },
-  th: { id:'payam1394/traxlate-mms-tts-tha', label:'泰语' }
-};
-const LOCAL_TTS_LIBRARY_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
-const LOCAL_TTS_DB_NAME = 'study-local-tts-v2';
-const LOCAL_TTS_DB_STORE = 'audio';
-const LOCAL_TTS_CACHE_PREFIX = 'mms-q8-v2';
-const LOCAL_TTS_MAX_SAVED = 1200;
 
-let localTtsLibPromise = null;
-let localTtsEngine = { lang:null, pipe:null, loading:null };
-let localTtsAudioContext = null;
-let localTtsAudioSource = null;
-let localTtsDbPromise = null;
-let localTtsWarmTimer = null;
-let localTtsTrimCounter = 0;
-const localTtsInflight = new Map();
-const localTtsDecoded = new Map();
+const STATIC_AUDIO_VERSION = 'v3.7-aac32';
+const staticAudioManifestCache = {};
+const staticAudioManifestLoading = {};
+let staticAudioPlayer = null;
+let staticAudioStopTimer = null;
+let staticAudioEnd = 0;
+let staticAudioPreparedUrl = '';
+let staticAudioWarmTimer = null;
+const staticAudioPrefetched = new Set();
 
-function localTtsKey(lang, text) {
-  return `${LOCAL_TTS_CACHE_PREFIX}|${lang}|${String(text || '').trim()}`;
-}
-
-function primeLocalTtsAudio() {
-  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextCtor) return null;
-  try {
-    if (!localTtsAudioContext) localTtsAudioContext = new AudioContextCtor();
-    if (localTtsAudioContext.state === 'suspended') localTtsAudioContext.resume().catch(()=>{});
-    return localTtsAudioContext;
-  } catch (err) {
-    console.warn('local tts audio context unavailable', err);
-    return null;
+function staticAudioKey(lang, text) {
+  const value = `${lang}\u0000${String(text || '').replace(/\s+/g,' ').trim()}`;
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x9e3779b9 >>> 0;
+  for (const ch of value) {
+    const c = ch.codePointAt(0) >>> 0;
+    h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
+    h2 = Math.imul((h2 ^ c) >>> 0, 0x85ebca6b) >>> 0;
   }
+  return h1.toString(16).padStart(8,'0') + h2.toString(16).padStart(8,'0');
 }
 
-function stopLocalTtsAudio() {
-  try { localTtsAudioSource?.stop?.(); } catch {}
-  localTtsAudioSource = null;
+function staticAudioUrl(lang, file) {
+  return `./audio/${lang}/${file}`;
 }
 
-function rememberDecodedAudio(key, buffer) {
-  if (!buffer) return;
-  if (localTtsDecoded.has(key)) localTtsDecoded.delete(key);
-  localTtsDecoded.set(key, buffer);
-  while (localTtsDecoded.size > 24) {
-    const oldest = localTtsDecoded.keys().next().value;
-    localTtsDecoded.delete(oldest);
-  }
+async function ensureStaticAudioManifest(lang=state.lang) {
+  if (staticAudioManifestCache[lang]) return staticAudioManifestCache[lang];
+  if (staticAudioManifestLoading[lang]) return staticAudioManifestLoading[lang];
+  staticAudioManifestLoading[lang] = fetch(`./audio/${lang}/manifest.json`, { cache:'force-cache' })
+    .then(r => {
+      if (!r.ok) throw new Error(`静态语音索引 ${r.status}`);
+      return r.json();
+    })
+    .then(data => {
+      staticAudioManifestCache[lang] = data?.items || {};
+      delete staticAudioManifestLoading[lang];
+      return staticAudioManifestCache[lang];
+    })
+    .catch(err => {
+      console.warn('静态语音索引未就绪', err);
+      delete staticAudioManifestLoading[lang];
+      return null;
+    });
+  return staticAudioManifestLoading[lang];
 }
 
-function playAudioBuffer(buffer) {
-  const ctx = primeLocalTtsAudio();
-  if (!ctx || !buffer) throw new Error('当前浏览器不能播放本地语音');
-  stopLocalTtsAudio();
-  const source = ctx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(ctx.destination);
-  source.onended = () => { if (localTtsAudioSource === source) localTtsAudioSource = null; };
-  localTtsAudioSource = source;
-  if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
-  source.start(0);
+function getStaticAudioPlayer() {
+  if (staticAudioPlayer) return staticAudioPlayer;
+  const player = new Audio();
+  player.preload = 'auto';
+  player.playsInline = true;
+  player.playbackRate = 1;
+  player.addEventListener('timeupdate', () => {
+    if (staticAudioEnd > 0 && player.currentTime >= staticAudioEnd - 0.015) {
+      player.pause();
+      staticAudioEnd = 0;
+    }
+  });
+  player.addEventListener('ended', () => { staticAudioEnd = 0; });
+  staticAudioPlayer = player;
+  return player;
 }
 
-function playFloatSamples(samples, sampleRate, key='') {
-  const ctx = primeLocalTtsAudio();
-  if (!ctx) throw new Error('当前浏览器不能播放本地语音');
-  const data = samples instanceof Float32Array ? samples : Float32Array.from(samples || []);
-  if (!data.length) throw new Error('没有生成有效语音');
-  const buffer = ctx.createBuffer(1, data.length, Number(sampleRate) || 16000);
-  buffer.copyToChannel(data, 0);
-  if (key) rememberDecodedAudio(key, buffer);
-  playAudioBuffer(buffer);
-}
-
-function floatSamplesToWavBlob(samples, sampleRate) {
-  const data = samples instanceof Float32Array ? samples : Float32Array.from(samples || []);
-  const rate = Number(sampleRate) || 16000;
-  const buffer = new ArrayBuffer(44 + data.length * 2);
-  const view = new DataView(buffer);
-  const writeString = (offset, value) => {
-    for (let i=0; i<value.length; i++) view.setUint8(offset+i, value.charCodeAt(i));
-  };
-  writeString(0, 'RIFF');
-  view.setUint32(4, 36 + data.length * 2, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, rate, true);
-  view.setUint32(28, rate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeString(36, 'data');
-  view.setUint32(40, data.length * 2, true);
-  let offset = 44;
-  for (let i=0; i<data.length; i++, offset+=2) {
-    const value = Math.max(-1, Math.min(1, data[i]));
-    view.setInt16(offset, value < 0 ? value * 0x8000 : value * 0x7fff, true);
-  }
-  return new Blob([buffer], { type:'audio/wav' });
-}
-
-function openLocalTtsDb() {
-  if (localTtsDbPromise) return localTtsDbPromise;
-  localTtsDbPromise = new Promise((resolve, reject) => {
-    if (!('indexedDB' in window)) return reject(new Error('IndexedDB unavailable'));
-    const request = indexedDB.open(LOCAL_TTS_DB_NAME, 2);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      let store;
-      if (!db.objectStoreNames.contains(LOCAL_TTS_DB_STORE)) {
-        store = db.createObjectStore(LOCAL_TTS_DB_STORE, { keyPath:'key' });
-      } else {
-        store = request.transaction.objectStore(LOCAL_TTS_DB_STORE);
-      }
-      if (!store.indexNames.contains('createdAt')) store.createIndex('createdAt', 'createdAt');
+function waitForAudioReady(player, timeout=7000) {
+  if (player.readyState >= 1) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      player.removeEventListener('loadedmetadata', onReady);
+      player.removeEventListener('canplay', onReady);
+      player.removeEventListener('error', onError);
+      fn();
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
-  }).catch(err => {
-    localTtsDbPromise = null;
-    console.warn('local tts cache unavailable', err);
-    return null;
+    const onReady = () => finish(resolve);
+    const onError = () => finish(() => reject(new Error('音频加载失败')));
+    const timer = setTimeout(() => finish(() => reject(new Error('音频加载超时'))), timeout);
+    player.addEventListener('loadedmetadata', onReady, { once:true });
+    player.addEventListener('canplay', onReady, { once:true });
+    player.addEventListener('error', onError, { once:true });
   });
-  return localTtsDbPromise;
 }
 
-async function getSavedLocalTts(key) {
-  const db = await openLocalTtsDb();
-  if (!db) return null;
-  return new Promise(resolve => {
+async function lookupStaticAudio(text, lang=state.lang) {
+  const manifest = await ensureStaticAudioManifest(lang);
+  if (!manifest) return null;
+  return manifest[staticAudioKey(lang, text)] || null;
+}
+
+function prepareStaticAudioShard(lang, meta) {
+  if (!meta || !Array.isArray(meta) || !meta[0]) return;
+  const url = staticAudioUrl(lang, meta[0]);
+  const player = getStaticAudioPlayer();
+  if (staticAudioPreparedUrl !== url) {
+    staticAudioPreparedUrl = url;
     try {
-      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readonly');
-      const req = tx.objectStore(LOCAL_TTS_DB_STORE).get(key);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => resolve(null);
-    } catch { resolve(null); }
-  });
-}
-
-async function trimSavedLocalTts() {
-  const db = await openLocalTtsDb();
-  if (!db) return;
-  try {
-    const count = await new Promise(resolve => {
-      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readonly');
-      const req = tx.objectStore(LOCAL_TTS_DB_STORE).count();
-      req.onsuccess = () => resolve(Number(req.result || 0));
-      req.onerror = () => resolve(0);
-    });
-    let removeCount = Math.max(0, count - LOCAL_TTS_MAX_SAVED);
-    if (!removeCount) return;
-    await new Promise(resolve => {
-      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readwrite');
-      const index = tx.objectStore(LOCAL_TTS_DB_STORE).index('createdAt');
-      const req = index.openKeyCursor();
-      req.onsuccess = () => {
-        const cursor = req.result;
-        if (!cursor || removeCount <= 0) return;
-        tx.objectStore(LOCAL_TTS_DB_STORE).delete(cursor.primaryKey);
-        removeCount -= 1;
-        cursor.continue();
-      };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch (err) {
-    console.warn('local tts cache trim failed', err);
+      player.pause();
+      player.src = url;
+      player.load();
+    } catch {}
   }
 }
 
-async function saveLocalTts(key, lang, text, blob) {
-  const db = await openLocalTtsDb();
-  if (!db || !blob) return;
-  try {
-    await new Promise(resolve => {
-      const tx = db.transaction(LOCAL_TTS_DB_STORE, 'readwrite');
-      tx.objectStore(LOCAL_TTS_DB_STORE).put({
-        key, lang, text, blob, createdAt:Date.now()
-      });
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-    localTtsTrimCounter += 1;
-    if (localTtsTrimCounter % 20 === 0) trimSavedLocalTts();
-  } catch (err) {
-    console.warn('local tts cache save failed', err);
-  }
-}
-
-async function loadLocalTtsLibrary() {
-  if (localTtsLibPromise) return localTtsLibPromise;
-  localTtsLibPromise = import(LOCAL_TTS_LIBRARY_URL).then(mod => {
-    if (mod?.env) {
-      mod.env.allowLocalModels = false;
-      mod.env.useBrowserCache = true;
-      try {
-        if (mod.env.backends?.onnx?.wasm) mod.env.backends.onnx.wasm.numThreads = 1;
-      } catch {}
-    }
-    return mod;
-  }).catch(err => {
-    localTtsLibPromise = null;
-    throw err;
-  });
-  return localTtsLibPromise;
-}
-
-async function disposeLocalTtsEngine() {
-  const old = localTtsEngine.pipe;
-  localTtsEngine = { lang:null, pipe:null, loading:null };
-  try { await old?.dispose?.(); } catch {}
-}
-
-async function ensureLocalTtsEngine(lang) {
-  const targetLang = LOCAL_TTS_MODELS[lang] ? lang : 'en';
-  if (localTtsEngine.lang === targetLang && localTtsEngine.pipe) return localTtsEngine.pipe;
-  if (localTtsEngine.lang === targetLang && localTtsEngine.loading) return localTtsEngine.loading;
-
-  const loading = (async () => {
-    const mod = await loadLocalTtsLibrary();
-    const cfg = LOCAL_TTS_MODELS[targetLang];
-    if (localTtsEngine.pipe && localTtsEngine.lang !== targetLang) await disposeLocalTtsEngine();
-
-    let pipe;
-    try {
-      pipe = await mod.pipeline('text-to-speech', cfg.id, { dtype:'q8', device:'wasm' });
-    } catch (firstErr) {
-      console.warn('q8 tts load failed, retry default mode', firstErr);
-      pipe = await mod.pipeline('text-to-speech', cfg.id, { device:'wasm' });
-    }
-    localTtsEngine = { lang:targetLang, pipe, loading:null };
-    return pipe;
-  })();
-
-  localTtsEngine = { lang:targetLang, pipe:null, loading };
-  try {
-    return await loading;
-  } catch (err) {
-    if (localTtsEngine.loading === loading) localTtsEngine = { lang:null, pipe:null, loading:null };
-    throw err;
-  }
+function prefetchStaticAudioShard(lang, meta) {
+  if (!meta || !Array.isArray(meta) || !meta[0]) return;
+  const url = staticAudioUrl(lang, meta[0]);
+  if (staticAudioPrefetched.has(url)) return;
+  staticAudioPrefetched.add(url);
+  fetch(url, { cache:'force-cache' }).catch(() => staticAudioPrefetched.delete(url));
 }
 
 function nativeSpeechFallback(value, lang) {
   const synth = window.speechSynthesis;
   const Utterance = window.SpeechSynthesisUtterance;
   if (!synth || typeof synth.speak !== 'function' || typeof Utterance !== 'function') {
-    showToast('当前浏览器暂时无法播放语音');
+    showToast('这条内容暂时没有预生成语音');
     return false;
   }
   const codes = { ko:'ko-KR', en:'en-US', th:'th-TH' };
@@ -11575,140 +11446,85 @@ function nativeSpeechFallback(value, lang) {
     synth.speak(utter);
     return true;
   } catch {
-    showToast('当前浏览器暂时无法播放语音');
+    showToast('这条内容暂时没有预生成语音');
     return false;
   }
 }
 
-async function decodeAndPlaySavedLocalTts(key, blob) {
-  const cachedDecoded = localTtsDecoded.get(key);
-  if (cachedDecoded) {
-    playAudioBuffer(cachedDecoded);
-    return true;
+async function playStaticAudio(meta, lang=state.lang) {
+  if (!meta || !Array.isArray(meta)) return false;
+  const [file, start, end] = meta;
+  if (!file) return false;
+  const url = staticAudioUrl(lang, file);
+  const player = getStaticAudioPlayer();
+  clearTimeout(staticAudioStopTimer);
+  staticAudioEnd = 0;
+
+  if (staticAudioPreparedUrl !== url || !player.src) {
+    staticAudioPreparedUrl = url;
+    player.pause();
+    player.src = url;
+    player.load();
   }
-  const ctx = primeLocalTtsAudio();
-  if (!ctx || !blob) return false;
-  const arrayBuffer = await blob.arrayBuffer();
-  const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
-  rememberDecodedAudio(key, decoded);
-  playAudioBuffer(decoded);
+
+  await waitForAudioReady(player);
+  player.pause();
+  player.playbackRate = 1;
+  player.currentTime = Math.max(0, Number(start) || 0);
+  staticAudioEnd = Math.max(player.currentTime + 0.08, Number(end) || (player.currentTime + 1));
+  await player.play();
+
+  const durationMs = Math.max(120, (staticAudioEnd - player.currentTime + 0.05) * 1000);
+  staticAudioStopTimer = setTimeout(() => {
+    if (!player.paused && staticAudioEnd > 0) {
+      player.pause();
+      staticAudioEnd = 0;
+    }
+  }, durationMs);
   return true;
-}
-
-async function generateLocalTts(lang, value, { silent=false } = {}) {
-  const text = String(value || '').trim();
-  if (!text) return null;
-  const key = localTtsKey(lang, text);
-
-  const cached = await getSavedLocalTts(key);
-  if (cached?.blob) return { key, blob:cached.blob, cached:true };
-
-  if (localTtsInflight.has(key)) return localTtsInflight.get(key);
-
-  const task = (async () => {
-    const cfg = LOCAL_TTS_MODELS[lang] || LOCAL_TTS_MODELS.en;
-    const engineReady = localTtsEngine.lang === lang && !!localTtsEngine.pipe;
-    if (!silent && !engineReady) showToast(`首次准备${cfg.label}自然语音…`);
-    else if (!silent) showToast('正在生成本条语音…');
-
-    const pipe = await ensureLocalTtsEngine(lang);
-    const output = await pipe(text);
-    const samples = output?.audio ?? output?.data ?? output;
-    const sampleRate = output?.sampling_rate ?? output?.samplingRate ?? 16000;
-    if (!samples || !samples.length) throw new Error('语音模型没有返回音频');
-
-    const normalized = samples instanceof Float32Array ? samples : Float32Array.from(samples);
-    const blob = floatSamplesToWavBlob(normalized, sampleRate);
-    saveLocalTts(key, lang, text, blob);
-    return { key, blob, samples:normalized, sampleRate, cached:false };
-  })().finally(() => localTtsInflight.delete(key));
-
-  localTtsInflight.set(key, task);
-  return task;
 }
 
 async function speakText(text, lang=state.lang) {
   const value = String(text || '').trim();
   if (!value) { showToast('没有可聆听的内容'); return false; }
-
-  primeLocalTtsAudio();
-  stopLocalTtsAudio();
-
   try {
-    const key = localTtsKey(lang, value);
-    const decoded = localTtsDecoded.get(key);
-    if (decoded) {
-      playAudioBuffer(decoded);
-      return true;
-    }
-
-    const result = await generateLocalTts(lang, value);
-    if (!result) return false;
-
-    // 新生成的音频直接使用 Float32Array 播放，避免再次解码，响应更快。
-    if (result.samples?.length) {
-      playFloatSamples(result.samples, result.sampleRate, result.key);
-      return true;
-    }
-
-    if (result.blob) {
-      await decodeAndPlaySavedLocalTts(result.key, result.blob);
-      return true;
-    }
-    return false;
+    const meta = await lookupStaticAudio(value, lang);
+    if (meta) return await playStaticAudio(meta, lang);
   } catch (err) {
-    console.warn('local neural tts failed', err);
-    showToast('本地自然语音暂不可用，尝试系统语音');
-    return nativeSpeechFallback(value, lang);
+    console.warn('静态语音播放失败', err);
   }
+  return nativeSpeechFallback(value, lang);
 }
 
-function prefetchLocalTtsText(text, lang=state.lang) {
-  const value = String(text || '').trim();
-  if (!value) return;
-  const key = localTtsKey(lang, value);
-  if (localTtsDecoded.has(key) || localTtsInflight.has(key)) return;
-  getSavedLocalTts(key).then(cached => {
-    if (cached?.blob) return;
-    generateLocalTts(lang, value, { silent:true }).catch(err => console.warn('tts prefetch failed', err));
-  });
-}
-
-function scheduleLocalTtsWarmup() {
-  clearTimeout(localTtsWarmTimer);
-  const hasSpeakButtons = !!document.querySelector('[data-speak]');
-  const shouldWarm = hasSpeakButtons || route.page === 'materials' || route.page === 'learn' || route.page === 'review';
-  if (!shouldWarm) return;
-
+function scheduleStaticAudioWarmup() {
+  clearTimeout(staticAudioWarmTimer);
+  if (!document.querySelector('[data-speak]')) return;
   const lang = state.lang;
-  localTtsWarmTimer = setTimeout(async () => {
+  staticAudioWarmTimer = setTimeout(async () => {
     try {
-      await ensureLocalTtsEngine(lang);
-
-      // 当前页面最先出现的 1~2 条先静默生成。
-      // 单卡片页还会额外预生成“下一条”，这样切换后再点聆听通常更快。
-      const visible = [...document.querySelectorAll('[data-speak]')]
-        .slice(0, 2)
+      const manifest = await ensureStaticAudioManifest(lang);
+      if (!manifest) return;
+      const values = [...document.querySelectorAll('[data-speak]')]
+        .slice(0, 3)
         .map(el => {
           try { return decodeURIComponent(el.dataset.speak || ''); }
           catch { return el.dataset.speak || ''; }
         })
         .filter(Boolean);
-
-      const queue = [...visible];
       if (route.page === 'materials') {
-        if (currentMaterialSpeechText) queue.unshift(currentMaterialSpeechText);
-        if (nextMaterialSpeechText) queue.push(nextMaterialSpeechText);
+        if (currentMaterialSpeechText) values.unshift(currentMaterialSpeechText);
+        if (nextMaterialSpeechText) values.push(nextMaterialSpeechText);
       }
-
-      const unique = [...new Set(queue.map(x => String(x).trim()).filter(Boolean))].slice(0, 3);
-      for (const value of unique) {
-        await generateLocalTts(lang, value, { silent:true }).catch(()=>null);
+      const unique = [...new Set(values.map(x => String(x).trim()).filter(Boolean))].slice(0, 4);
+      const metas = unique.map(v => manifest[staticAudioKey(lang, v)]).filter(Boolean);
+      if (metas[0]) prepareStaticAudioShard(lang, metas[0]);
+      for (const meta of metas.slice(1)) {
+        if (!metas[0] || meta[0] !== metas[0][0]) prefetchStaticAudioShard(lang, meta);
       }
     } catch (err) {
-      console.warn('local tts warmup failed', err);
+      console.warn('静态语音预加载失败', err);
     }
-  }, 320);
+  }, 100);
 }
 
 function currentLevel(lang=state.lang) {
@@ -11780,7 +11596,7 @@ function render() {
   else if (route.page === 'notes') page.innerHTML = notesHTML();
   else if (route.page === 'ai') page.innerHTML = aiHTML();
   bindPageEvents();
-  scheduleLocalTtsWarmup();
+  scheduleStaticAudioWarmup();
 }
 
 function homeHTML() {
@@ -11885,18 +11701,26 @@ function materialsHTML() {
       <p class="page-subtitle">一次只学一个，使用“上一个 / 下一个”连续切换。也可以先筛选单词、句子或主题，再逐个学习。</p>
     </div>
 
-    <input id="materialSearchInput" class="search" value="${escapeHTML(materialSearch)}" placeholder="搜索单词、句子或中文意思" />
+    <details id="materialFilterPanel" class="material-filter-panel" ${materialFiltersExpanded?'open':''}>
+      <summary class="material-filter-summary">
+        <span><strong>筛选与主题</strong><small>${materialFilter==='all'?'全部':materialFilter==='word'?'单词':'句子'} · ${materialTopic==='all'?'全部主题':escapeHTML(materialTopic)}</small></span>
+        <span class="material-filter-summary-action">展开选择</span>
+      </summary>
+      <div class="material-filter-body">
+        <input id="materialSearchInput" class="search" value="${escapeHTML(materialSearch)}" placeholder="搜索单词、句子或中文意思" />
 
-    <div class="chips material-filter-row">
-      <button class="chip ${materialFilter==='all'?'active':''}" data-material-filter="all">全部 ${all.length.toLocaleString()}</button>
-      <button class="chip ${materialFilter==='word'?'active':''}" data-material-filter="word">单词 ${countWord.toLocaleString()}</button>
-      <button class="chip ${materialFilter==='sentence'?'active':''}" data-material-filter="sentence">句子 ${countSentence.toLocaleString()}</button>
-    </div>
+        <div class="chips material-filter-row">
+          <button class="chip ${materialFilter==='all'?'active':''}" data-material-filter="all">全部 ${all.length.toLocaleString()}</button>
+          <button class="chip ${materialFilter==='word'?'active':''}" data-material-filter="word">单词 ${countWord.toLocaleString()}</button>
+          <button class="chip ${materialFilter==='sentence'?'active':''}" data-material-filter="sentence">句子 ${countSentence.toLocaleString()}</button>
+        </div>
 
-    <div class="chips topic-row">
-      <button class="chip ${materialTopic==='all'?'active':''}" data-material-topic="all">全部主题</button>
-      ${topics.map(t=>`<button class="chip ${materialTopic===t?'active':''}" data-material-topic="${escapeHTML(t)}">${escapeHTML(t)}</button>`).join('')}
-    </div>
+        <div class="chips topic-row">
+          <button class="chip ${materialTopic==='all'?'active':''}" data-material-topic="all">全部主题</button>
+          ${topics.map(t=>`<button class="chip ${materialTopic===t?'active':''}" data-material-topic="${escapeHTML(t)}">${escapeHTML(t)}</button>`).join('')}
+        </div>
+      </div>
+    </details>
 
     ${x ? `<section class="material-study-shell">
       <div class="material-study-status">
@@ -12021,6 +11845,7 @@ function bindPageEvents() {
   document.getElementById('wordSearch')?.addEventListener('input',e=>{searchText=e.target.value; render(); document.getElementById('wordSearch')?.focus();});
   document.getElementById('noteSearch')?.addEventListener('input',e=>{searchText=e.target.value; render(); document.getElementById('noteSearch')?.focus();});
   document.querySelectorAll('[data-filter]').forEach(el=>el.onclick=()=>{wordFilter=el.dataset.filter;render();});
+  document.getElementById('materialFilterPanel')?.addEventListener('toggle',e=>{materialFiltersExpanded=!!e.currentTarget.open;});
   document.getElementById('materialSearchInput')?.addEventListener('input',e=>{materialSearch=e.target.value;materialCurrentIndex=0;render();document.getElementById('materialSearchInput')?.focus();});
   document.querySelectorAll('[data-material-filter]').forEach(el=>el.onclick=()=>{materialFilter=el.dataset.materialFilter;materialCurrentIndex=0;render();});
   document.querySelectorAll('[data-material-topic]').forEach(el=>el.onclick=()=>{materialTopic=el.dataset.materialTopic;materialCurrentIndex=0;render();});
@@ -12062,7 +11887,7 @@ function navigate(page) {
   searchText='';
   if (page==='learn' || page==='materials') ensureMaterialBank(state.lang);
   if (page !== 'materials') materialSearch='';
-  if (page === 'materials') { materialVisibleCount=40; materialCurrentIndex=0; }
+  if (page === 'materials') { materialVisibleCount=40; materialCurrentIndex=0; materialFiltersExpanded=false; }
   if (page === 'review') startReviewSession();
   else if (route.page === 'review') reviewSession = null;
   route={page,lessonId:null};
