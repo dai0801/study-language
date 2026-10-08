@@ -1,4 +1,4 @@
-const CACHE = 'study-v3.7-static-audio';
+const CACHE = 'study-v3.7.5-native-speech-1x';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.json', './icon.svg', './SOURCES.md'];
 
 self.addEventListener('install', event => {
