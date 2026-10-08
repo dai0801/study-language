@@ -4,7 +4,7 @@ import readline from 'node:readline';
 let parse, unbzip2, romanize, romanizeSentence;
 
 const DATA_DIR = 'dist/data';
-const UA = 'Study-Language-Personal/3.3 (+personal study build)';
+const UA = 'Study-Language-Personal/3.7.5 (+personal study build)';
 const seed = JSON.parse(await readFile('public/data/seed-materials.json','utf8'));
 
 if(process.env.SKIP_REMOTE_DATA!=='1'){
@@ -33,41 +33,6 @@ const safeFetch = async (url) => {
   return r;
 };
 const textFetch = async url => (await safeFetch(url)).text();
-
-async function downloadBinaryWithMirrors(name, urls) {
-  let lastError;
-  for (const url of urls) {
-    try {
-      const r = await safeFetch(url);
-      const bytes = new Uint8Array(await r.arrayBuffer());
-      await writeFile(`dist/tts/${name}`, bytes);
-      console.log(`[tts] ${name} ${bytes.length} bytes`);
-      return;
-    } catch (err) {
-      lastError = err;
-      console.warn(`[tts] download failed ${url}: ${err.message}`);
-    }
-  }
-  throw lastError || new Error(`无法下载 ${name}`);
-}
-
-async function installBrowserFallbackTTS() {
-  await mkdir('dist/tts', { recursive:true });
-  const roots = [
-    'https://cdn.jsdelivr.net/gh/steveseguin/espeakng.js@master/js',
-    'https://raw.githubusercontent.com/steveseguin/espeakng.js/master/js'
-  ];
-  for (const name of ['espeakng-simple.js','espeakng.worker.js','espeakng.worker.data']) {
-    await downloadBinaryWithMirrors(name, roots.map(root => `${root}/${name}`));
-  }
-  await downloadBinaryWithMirrors('LICENSE', [
-    'https://cdn.jsdelivr.net/gh/steveseguin/espeakng.js@master/LICENSE',
-    'https://raw.githubusercontent.com/steveseguin/espeakng.js/master/LICENSE'
-  ]);
-  await writeFile('dist/tts/README.txt', 'Browser fallback TTS: eSpeak-ng JavaScript port. GPLv3. Source: https://github.com/steveseguin/espeakng.js\n');
-}
-
-await installBrowserFallbackTTS();
 
 function romanizeKorean(text='') {
   const L=['g','kk','n','d','tt','r','m','b','pp','s','ss','','j','jj','ch','k','t','p','h'];
@@ -211,12 +176,11 @@ function mergeWithSeed(lang, generated){
   return uniq([...seeded,...generated]);
 }
 
-const meta={version:'3.3.0',builtAt:new Date().toISOString(),libraries:{},sources:[
+const meta={version:'3.1.0',builtAt:new Date().toISOString(),libraries:{},sources:[
   {name:'Open Yonsei Korean Vocabulary',license:'CC BY-SA 3.0',url:'https://github.com/sugalhjk-tech/yonsei-korean-vocabulary'},
   {name:'ECDICT',license:'Open-source project; see upstream license/provenance',url:'https://github.com/skywind3000/ECDICT'},
   {name:'LEXiTRON 2.0',license:'Open Data Common',url:'https://opend.nstda.or.th/en/dataset/lexitron-2-0'},
-  {name:'Tatoeba',license:'CC BY 2.0 FR / some CC0',url:'https://tatoeba.org/en/downloads'},
-  {name:'eSpeak-ng JavaScript fallback TTS',license:'GPLv3',url:'https://github.com/steveseguin/espeakng.js'}
+  {name:'Tatoeba',license:'CC BY 2.0 FR / some CC0',url:'https://tatoeba.org/en/downloads'}
 ]};
 
 async function buildLanguage(lang, wordBuilder){
