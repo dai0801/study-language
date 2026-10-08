@@ -11314,217 +11314,57 @@ function aiProviderInfo() { return AI_PROVIDERS[state.ai.provider] || AI_PROVIDE
 
 
 
-const STATIC_AUDIO_VERSION = 'v3.7-aac32';
-const staticAudioManifestCache = {};
-const staticAudioManifestLoading = {};
-let staticAudioPlayer = null;
-let staticAudioStopTimer = null;
-let staticAudioEnd = 0;
-let staticAudioPreparedUrl = '';
-let staticAudioWarmTimer = null;
-const staticAudioPrefetched = new Set();
+const SPEECH_LANGS = { ko:'ko-KR', en:'en-US', th:'th-TH' };
+let speechVoices = [];
+let speechVoiceCache = {};
 
-function staticAudioKey(lang, text) {
-  const value = `${lang}\u0000${String(text || '').replace(/\s+/g,' ').trim()}`;
-  let h1 = 0x811c9dc5 >>> 0;
-  let h2 = 0x9e3779b9 >>> 0;
-  for (const ch of value) {
-    const c = ch.codePointAt(0) >>> 0;
-    h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
-    h2 = Math.imul((h2 ^ c) >>> 0, 0x85ebca6b) >>> 0;
-  }
-  return h1.toString(16).padStart(8,'0') + h2.toString(16).padStart(8,'0');
+function warmSpeechVoices() {
+  if (!('speechSynthesis' in window)) return;
+  const update = () => { speechVoices = window.speechSynthesis.getVoices?.() || []; speechVoiceCache = {}; };
+  update();
+  window.speechSynthesis.addEventListener?.('voiceschanged', update);
 }
 
-function staticAudioUrl(lang, file) {
-  return `./audio/${lang}/${file}`;
+function bestVoiceFor(langCode) {
+  if (speechVoiceCache[langCode]) return speechVoiceCache[langCode];
+  const prefix = langCode.slice(0,2).toLowerCase();
+  const list = speechVoices.length ? speechVoices : (window.speechSynthesis?.getVoices?.() || []);
+  const candidates = list.filter(v => String(v.lang || '').toLowerCase().startsWith(prefix));
+  const chosen = candidates.find(v => v.localService && String(v.lang).toLowerCase() === langCode.toLowerCase())
+    || candidates.find(v => v.localService)
+    || candidates.find(v => String(v.lang).toLowerCase() === langCode.toLowerCase())
+    || candidates[0]
+    || null;
+  if (chosen) speechVoiceCache[langCode] = chosen;
+  return chosen;
 }
 
-async function ensureStaticAudioManifest(lang=state.lang) {
-  if (staticAudioManifestCache[lang]) return staticAudioManifestCache[lang];
-  if (staticAudioManifestLoading[lang]) return staticAudioManifestLoading[lang];
-  staticAudioManifestLoading[lang] = fetch(`./audio/${lang}/manifest.json`, { cache:'force-cache' })
-    .then(r => {
-      if (!r.ok) throw new Error(`静态语音索引 ${r.status}`);
-      return r.json();
-    })
-    .then(data => {
-      staticAudioManifestCache[lang] = data?.items || {};
-      delete staticAudioManifestLoading[lang];
-      return staticAudioManifestCache[lang];
-    })
-    .catch(err => {
-      console.warn('静态语音索引未就绪', err);
-      delete staticAudioManifestLoading[lang];
-      return null;
-    });
-  return staticAudioManifestLoading[lang];
-}
-
-function getStaticAudioPlayer() {
-  if (staticAudioPlayer) return staticAudioPlayer;
-  const player = new Audio();
-  player.preload = 'auto';
-  player.playsInline = true;
-  player.playbackRate = 1;
-  player.addEventListener('timeupdate', () => {
-    if (staticAudioEnd > 0 && player.currentTime >= staticAudioEnd - 0.015) {
-      player.pause();
-      staticAudioEnd = 0;
-    }
-  });
-  player.addEventListener('ended', () => { staticAudioEnd = 0; });
-  staticAudioPlayer = player;
-  return player;
-}
-
-function waitForAudioReady(player, timeout=7000) {
-  if (player.readyState >= 1) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    let done = false;
-    const finish = (fn) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      player.removeEventListener('loadedmetadata', onReady);
-      player.removeEventListener('canplay', onReady);
-      player.removeEventListener('error', onError);
-      fn();
-    };
-    const onReady = () => finish(resolve);
-    const onError = () => finish(() => reject(new Error('音频加载失败')));
-    const timer = setTimeout(() => finish(() => reject(new Error('音频加载超时'))), timeout);
-    player.addEventListener('loadedmetadata', onReady, { once:true });
-    player.addEventListener('canplay', onReady, { once:true });
-    player.addEventListener('error', onError, { once:true });
-  });
-}
-
-async function lookupStaticAudio(text, lang=state.lang) {
-  const manifest = await ensureStaticAudioManifest(lang);
-  if (!manifest) return null;
-  return manifest[staticAudioKey(lang, text)] || null;
-}
-
-function prepareStaticAudioShard(lang, meta) {
-  if (!meta || !Array.isArray(meta) || !meta[0]) return;
-  const url = staticAudioUrl(lang, meta[0]);
-  const player = getStaticAudioPlayer();
-  if (staticAudioPreparedUrl !== url) {
-    staticAudioPreparedUrl = url;
-    try {
-      player.pause();
-      player.src = url;
-      player.load();
-    } catch {}
-  }
-}
-
-function prefetchStaticAudioShard(lang, meta) {
-  if (!meta || !Array.isArray(meta) || !meta[0]) return;
-  const url = staticAudioUrl(lang, meta[0]);
-  if (staticAudioPrefetched.has(url)) return;
-  staticAudioPrefetched.add(url);
-  fetch(url, { cache:'force-cache' }).catch(() => staticAudioPrefetched.delete(url));
-}
-
-function nativeSpeechFallback(value, lang) {
-  const synth = window.speechSynthesis;
-  const Utterance = window.SpeechSynthesisUtterance;
-  if (!synth || typeof synth.speak !== 'function' || typeof Utterance !== 'function') {
-    showToast('这条内容暂时没有预生成语音');
-    return false;
-  }
-  const codes = { ko:'ko-KR', en:'en-US', th:'th-TH' };
-  try {
-    synth.cancel();
-    const utter = new Utterance(value);
-    utter.lang = codes[lang] || 'en-US';
-    utter.rate = 1;
-    utter.pitch = 1;
-    utter.volume = 1;
-    synth.speak(utter);
-    return true;
-  } catch {
-    showToast('这条内容暂时没有预生成语音');
-    return false;
-  }
-}
-
-async function playStaticAudio(meta, lang=state.lang) {
-  if (!meta || !Array.isArray(meta)) return false;
-  const [file, start, end] = meta;
-  if (!file) return false;
-  const url = staticAudioUrl(lang, file);
-  const player = getStaticAudioPlayer();
-  clearTimeout(staticAudioStopTimer);
-  staticAudioEnd = 0;
-
-  if (staticAudioPreparedUrl !== url || !player.src) {
-    staticAudioPreparedUrl = url;
-    player.pause();
-    player.src = url;
-    player.load();
-  }
-
-  await waitForAudioReady(player);
-  player.pause();
-  player.playbackRate = 1;
-  player.currentTime = Math.max(0, Number(start) || 0);
-  staticAudioEnd = Math.max(player.currentTime + 0.08, Number(end) || (player.currentTime + 1));
-  await player.play();
-
-  const durationMs = Math.max(120, (staticAudioEnd - player.currentTime + 0.05) * 1000);
-  staticAudioStopTimer = setTimeout(() => {
-    if (!player.paused && staticAudioEnd > 0) {
-      player.pause();
-      staticAudioEnd = 0;
-    }
-  }, durationMs);
-  return true;
-}
-
-async function speakText(text, lang=state.lang) {
+function speakText(text) {
   const value = String(text || '').trim();
-  if (!value) { showToast('没有可聆听的内容'); return false; }
-  try {
-    const meta = await lookupStaticAudio(value, lang);
-    if (meta) return await playStaticAudio(meta, lang);
-  } catch (err) {
-    console.warn('静态语音播放失败', err);
+  if (!value) { showToast('没有可聆听的内容'); return; }
+  if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
+    showToast('当前浏览器暂不支持聆听');
+    return;
   }
-  return nativeSpeechFallback(value, lang);
-}
-
-function scheduleStaticAudioWarmup() {
-  clearTimeout(staticAudioWarmTimer);
-  if (!document.querySelector('[data-speak]')) return;
-  const lang = state.lang;
-  staticAudioWarmTimer = setTimeout(async () => {
-    try {
-      const manifest = await ensureStaticAudioManifest(lang);
-      if (!manifest) return;
-      const values = [...document.querySelectorAll('[data-speak]')]
-        .slice(0, 3)
-        .map(el => {
-          try { return decodeURIComponent(el.dataset.speak || ''); }
-          catch { return el.dataset.speak || ''; }
-        })
-        .filter(Boolean);
-      if (route.page === 'materials') {
-        if (currentMaterialSpeechText) values.unshift(currentMaterialSpeechText);
-        if (nextMaterialSpeechText) values.push(nextMaterialSpeechText);
-      }
-      const unique = [...new Set(values.map(x => String(x).trim()).filter(Boolean))].slice(0, 4);
-      const metas = unique.map(v => manifest[staticAudioKey(lang, v)]).filter(Boolean);
-      if (metas[0]) prepareStaticAudioShard(lang, metas[0]);
-      for (const meta of metas.slice(1)) {
-        if (!metas[0] || meta[0] !== metas[0][0]) prefetchStaticAudioShard(lang, meta);
-      }
-    } catch (err) {
-      console.warn('静态语音预加载失败', err);
-    }
-  }, 100);
+  const synth = window.speechSynthesis;
+  const speechLang = SPEECH_LANGS[state.lang] || 'en-US';
+  const utter = new SpeechSynthesisUtterance(value);
+  utter.lang = speechLang;
+  utter.rate = 1.0;
+  utter.pitch = 1;
+  const voice = bestVoiceFor(speechLang);
+  if (voice) utter.voice = voice;
+  utter.onerror = event => {
+    const reason = String(event?.error || '').toLowerCase();
+    if (reason === 'canceled' || reason === 'interrupted') return;
+    showToast(`当前设备的${langInfo().name}语音暂不可用`);
+  };
+  if (synth.speaking || synth.pending) {
+    synth.cancel();
+    requestAnimationFrame(() => synth.speak(utter));
+  } else {
+    synth.speak(utter);
+  }
 }
 
 function currentLevel(lang=state.lang) {
@@ -11596,7 +11436,6 @@ function render() {
   else if (route.page === 'notes') page.innerHTML = notesHTML();
   else if (route.page === 'ai') page.innerHTML = aiHTML();
   bindPageEvents();
-  scheduleStaticAudioWarmup();
 }
 
 function homeHTML() {
@@ -11857,19 +11696,10 @@ function bindPageEvents() {
   document.querySelectorAll('[data-save-example-front]').forEach(el=>el.onclick=()=>{ const front=decodeURIComponent(el.dataset.saveExampleFront), meaning=decodeURIComponent(el.dataset.saveExampleMeaning), romanization=decodeURIComponent(el.dataset.saveExampleRomanization||''); addStudyItem('sentence',front,meaning,'',romanization); showToast('已加入复习'); });
   document.getElementById('checkQuiz')?.addEventListener('click',e=>{ const ans=decodeURIComponent(e.currentTarget.dataset.answer); const mine=document.getElementById('quizAnswer').value.trim(); document.getElementById('quizFeedback').innerHTML= mine ? `参考答案：<strong>${escapeHTML(ans)}</strong><br>你的答案：${escapeHTML(mine)}` : `参考答案：<strong>${escapeHTML(ans)}</strong>`; });
   document.querySelectorAll('[data-ask-ai]').forEach(el=>el.onclick=()=>{ const prompt=decodeURIComponent(el.dataset.askAi); route={page:'ai',lessonId:null}; render(); setTimeout(()=>sendAI(prompt),50); });
-  document.querySelectorAll('[data-speak]').forEach(el=>el.onclick=async e=>{
-    e.preventDefault(); e.stopPropagation();
-    const value = decodeURIComponent(el.dataset.speak || '');
-    const oldHTML = el.innerHTML;
-    el.disabled = true;
-    el.classList.add('speech-loading');
-    el.innerHTML = '🔊 准备中…';
-    try { await speakText(value, state.lang); }
-    finally {
-      el.disabled = false;
-      el.classList.remove('speech-loading');
-      el.innerHTML = oldHTML;
-    }
+  document.querySelectorAll('[data-speak]').forEach(el=>el.onclick=e=>{
+    e.preventDefault();
+    e.stopPropagation();
+    speakText(decodeURIComponent(el.dataset.speak || ''));
   });
   document.getElementById('revealMeaning')?.addEventListener('click',()=>{ document.getElementById('reviewMeaning').hidden=false; document.getElementById('reviewActions').hidden=false; document.getElementById('revealMeaning').hidden=true; });
   document.querySelectorAll('[data-review]').forEach(el=>el.onclick=()=>rateReview(el.dataset.itemId,el.dataset.review));
@@ -12118,6 +11948,7 @@ if ('serviceWorker' in navigator && (location.protocol==='https:' || location.ho
   window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));
 }
 
+warmSpeechVoices();
 ensureMaterialBank(state.lang);
 render();
 handleOpenRouterCallback();
